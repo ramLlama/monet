@@ -6,19 +6,21 @@ Monet is an Emacs package that implements the (undocumented) Claude Code IDE pro
 
 ## Tech Stack
 
-- **Language**: Emacs Lisp (single file: `monet.el`)
-- **Emacs version**: 30.0+ required
+- **Language**: Emacs Lisp (`monet.el` core + `monet-emacs-tools.el` extension)
+- **Emacs version**: 30.0+ required (tree-sitter tools require 29+)
 - **Dependencies**: `websocket` package (emacs-websocket 1.15+)
-- **Built-in deps**: `cl-lib`, `diff`, `ediff`, `json`, `project`, `subr-x`
+- **Built-in deps**: `cl-lib`, `diff`, `ediff`, `json`, `project`, `subr-x`, `xref`, `imenu`
 - **Protocol**: JSON-RPC 2.0 over WebSocket, MCP protocol version `2024-11-05`
-- **Build**: Makefile with `checkdoc` and `byte-compile` targets
+- **Build**: Makefile with `checkdoc`, `byte-compile`, and `test` (ERT) targets
 
 ## Repository Structure
 
 ```
 monet/
-  monet.el                      # Entire package implementation (~2140 lines)
-  Makefile                      # Build: checkdoc linting + byte-compilation
+  monet.el                      # Core implementation (~2160 lines)
+  monet-emacs-tools.el          # Opt-in introspection tools (xref, imenu, treesit)
+  monet-tests.el                # ERT test suite (30 tests)
+  Makefile                      # Build: checkdoc + byte-compile + test targets
   README.md                     # User-facing documentation
   CHANGELOG.md                  # Version history (currently at 0.0.3)
   LICENSE                       # Project license
@@ -26,8 +28,6 @@ monet/
   test-diff-visibility.el       # Manual test script for diff visibility
   .gitignore                    # Ignores .elc, backups, sockets-mcp/
 ```
-
-This is a single-file Emacs package -- all code lives in `monet.el`.
 
 ## Key Concepts & Domain Model
 
@@ -39,6 +39,34 @@ Each Claude Code connection is a **session**, stored in `monet--sessions` hash t
 - Deferred responses (for async diff accept/reject flows)
 - Originating buffer/tab/frame context
 
+### Tool Registry
+Tools are managed via a dynamic registry (`monet--tool-registry`), an alist of `(name . spec-plist)`. Each spec has `:description`, `:schema`, `:handler`, `:set`, and `:enabled`.
+
+**Public API** (defined in `monet.el`):
+- `monet-make-tool &rest plist` -- add or replace a tool (`:name`, `:description`, `:schema`, `:handler`, `:set`)
+- `monet-enable-tool NAME` / `monet-disable-tool NAME` -- toggle a single tool
+- `monet-enable-tool-set SET &optional RESET` / `monet-disable-tool-set SET` -- toggle all tools in a set
+- `monet-reset-tools` -- disable every tool
+- `monet-register-core-tools` -- reset registry and register all built-ins (called by `monet-mode`)
+
+**Tool sets:**
+- `:core` -- enabled by default: getCurrentSelection, getLatestSelection, getDiagnostics, getOpenEditors, getWorkspaceFolders, checkDocumentDirty, saveDocument, openFile
+- `:diff` -- enabled by default: openDiff, closeAllDiffTabs, close_tab
+- `:introspection` -- disabled by default (opt-in via `monet-emacs-tools.el`)
+- Custom sets -- any keyword; disabled by default on first registration
+
+**Overriding a tool (e.g. for Birbal):**
+```elisp
+(monet-make-tool :name "openDiff"
+                 :description "..."
+                 :schema '(...)
+                 :handler #'birbal--open-diff-handler
+                 :set :birbal)
+```
+Re-registering preserves the current `:enabled` state (ownership transfer).
+
+**Restoring defaults:** `(monet-register-core-tools)` clears the entire registry and re-registers built-ins. Call extension registration functions after it.
+
 ### MCP Tools
 The package exposes these tools to Claude Code via the MCP protocol:
 - `getCurrentSelection` / `getLatestSelection` -- editor selection state
@@ -48,9 +76,11 @@ The package exposes these tools to Claude Code via the MCP protocol:
 - `openDiff` / `closeAllDiffTabs` / `close_tab` -- diff display management
 
 ### Diff Tools
-Two diff display strategies, set via `monet-diff-tool`:
+Two diff display implementations in `monet.el`:
 1. **Simple diff** (default): Read-only `diff-mode` buffer, accept (`y`) or reject (`q`)
-2. **Ediff**: Interactive ediff session where user can edit proposed changes before accepting
+2. **Ediff** (`monet-ediff-tool`): Interactive ediff session
+
+The active strategy is selected by which handler is registered for `openDiff` via `monet-make-tool`. Each diff tool returns a context alist that includes a `cleanup-fn` key; `monet--cleanup-diff` dispatches to it polymorphically (falls back to `monet-simple-diff-cleanup-tool`).
 
 ### Deferred Responses
 The `openDiff` tool uses a deferred response pattern: the MCP request is not immediately answered. Instead, the response ID is stored, and the actual response is sent when the user accepts or rejects the diff.
@@ -78,10 +108,18 @@ make clean        # Remove .elc files
 ```
 
 ### Testing
-There are no automated tests (no ERT test suite). The file `test-diff-visibility.el` is a manual integration test script that creates mock sessions and tests diff visibility logic. Run it with:
+```bash
+make test         # Run ERT test suite (monet-tests.el, 30 tests)
+```
+
+The ERT suite in `monet-tests.el` covers the tool registry API, dispatch, enable/disable semantics, ownership transfer, and introspection tool formatting. Tests use the `monet-test-with-clean-registry` macro to isolate the global registry.
+
+`test-diff-visibility.el` is a separate manual integration test for diff visibility logic:
 ```bash
 emacs --batch -L . -l test-diff-visibility.el
 ```
+
+`make test` requires the `websocket` package; it looks for it at `ELPA_DIR` (defaults to `~/.emacs.d/elpa`, override as needed).
 
 ### Loading for Development
 ```elisp
@@ -92,25 +130,29 @@ emacs --batch -L . -l test-diff-visibility.el
 
 ## Critical Idiosyncrasies & Gotchas
 
-1. **Single-file package**: All ~2140 lines are in `monet.el`. No modular file organization.
+1. **Multi-file package**: Core in `monet.el` (~2160 lines); opt-in introspection tools in `monet-emacs-tools.el`; ERT tests in `monet-tests.el`.
 
 2. **Version mismatch**: `monet-version` constant is `"0.0.1"` but `Package-Requires` header says `Version: 0.0.3`. These are out of sync.
 
-3. **No automated tests**: Only a manual test script exists. Any changes should be tested by actually running Monet with Claude Code.
+3. **Deferred response pattern**: `openDiff` does NOT return an immediate MCP response. The response ID is stashed in `deferred-responses` and sent later when the user accepts/rejects. This is critical to understand when modifying diff handling.
 
-4. **Deferred response pattern**: `openDiff` does NOT return an immediate MCP response. The response ID is stashed in `deferred-responses` and sent later when the user accepts/rejects. This is critical to understand when modifying diff handling.
+4. **Evil-mode compatibility**: Significant code exists to handle evil-mode keybinding conflicts in diff buffers. The package creates a `monet-diff-mode` minor mode specifically for this. Changes to keybinding logic must preserve evil-mode support.
 
-5. **Evil-mode compatibility**: Significant code exists to handle evil-mode keybinding conflicts in diff buffers. The package creates a `monet-diff-mode` minor mode specifically for this. Changes to keybinding logic must preserve evil-mode support.
+5. **Tool customization via registry**: Override any built-in tool with `monet-make-tool`. The defcustom override variables (`monet-diff-tool`, `monet-open-file-tool`, etc.) have been removed — this is a breaking change from ≤0.0.3. Re-registering preserves `:enabled` state.
 
-6. **All tools are customizable**: Each MCP tool has a `defcustom` variable (e.g., `monet-diagnostics-tool`, `monet-open-file-tool`) that users can override with custom functions. The handler functions are thin adapters between MCP protocol and these customizable functions.
+6. **`monet-register-core-tools` clears everything**: It does `(setq monet--tool-registry nil)` then re-registers built-ins. Any externally registered tools (e.g. `:introspection` set) are lost. Always call extension registration functions *after* `monet-register-core-tools`.
 
-7. **Lockfile protocol**: Lockfiles at `~/.claude/ide/<port>.lock` contain JSON with `pid`, `workspaceFolders`, `ideName`, `transport`, and `authToken`. Claude Code discovers these to connect. Windows uses `USERPROFILE` instead of `~`.
+7. **Polymorphic diff cleanup**: `monet--cleanup-diff` calls the `cleanup-fn` stored in the diff context alist. Both `monet-simple-diff-tool` and `monet-ediff-tool` set this. Custom `openDiff` handlers must include `cleanup-fn` in their returned context or cleanup will silently fall back to `monet-simple-diff-cleanup-tool`.
 
-8. **Selection tracking runs on `post-command-hook`**: Every keystroke triggers selection tracking logic (debounced at 50ms). This must remain lightweight.
+8. **Lockfile protocol**: Lockfiles at `~/.claude/ide/<port>.lock` contain JSON with `pid`, `workspaceFolders`, `ideName`, `transport`, and `authToken`. Claude Code discovers these to connect. Windows uses `USERPROFILE` instead of `~`.
 
-9. **Ping keepalive**: A 30-second ping timer sends `notifications/tools/list_changed` as a keepalive. This is a workaround, not a real tools list change.
+9. **Selection tracking runs on `post-command-hook`**: Every keystroke triggers selection tracking logic (debounced at 50ms). This must remain lightweight.
 
-10. **Tab-bar integration**: Session tracks `originating-tab` for do-not-disturb mode. The code checks `tab-bar-mode` and `tab-bar--current-tab` (internal Emacs API).
+10. **Ping keepalive**: A 30-second ping timer sends `notifications/tools/list_changed` as a keepalive. This is a workaround, not a real tools list change.
+
+11. **Tab-bar integration**: Session tracks `originating-tab` for do-not-disturb mode. The code checks `tab-bar-mode` and `tab-bar--current-tab` (internal Emacs API).
+
+12. **Introspection tools are opt-in**: `monet-emacs-tools.el` must be loaded and `monet-register-emacs-tools` called, then `(monet-enable-tool-set :introspection)`. The `treesit_info` tool requires tree-sitter support (Emacs 29+ with `--with-tree-sitter`).
 
 ## Context Files
 
