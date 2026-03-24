@@ -28,6 +28,7 @@ compile: clean
 
 test:
 	$(EMACS) --batch $(LOAD_PATHS) -l ert -l monet.el -l monet-emacs-tools.el \
-		-l monet-tests.el -f ert-run-tests-batch-and-exit
+		-l monet-tests.el \
+		$(if $(MATCH),--eval "(ert-run-tests-batch-and-exit \"$(MATCH)\")",-f ert-run-tests-batch-and-exit)
 
 all: checkdoc compile
