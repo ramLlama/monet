@@ -17,9 +17,10 @@
 ;;; Test Helpers
 
 (defmacro monet-test-with-clean-registry (&rest body)
-  "Execute BODY with a clean, isolated tool registry."
+  "Execute BODY with a clean, isolated tool registry and enabled-sets."
   (declare (indent 0))
-  `(let ((monet--tool-registry nil))
+  `(let ((monet--tool-registry nil)
+         (monet--enabled-sets '(:core :simple-diff)))
      ,@body))
 
 ;;; Registry CRUD Tests
@@ -31,7 +32,9 @@
                      :description "Test"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore)
-    (should (assoc "testTool" monet--tool-registry))))
+    (should (cl-find "testTool" monet--tool-registry
+                     :key (lambda (e) (cdr (car e)))
+                     :test #'equal))))
 
 (ert-deftest monet-test-make-tool-lookup ()
   "Registered tool handler is retrievable from the registry."
@@ -40,8 +43,7 @@
                      :description "Test"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore)
-    (should (equal (plist-get (cdr (assoc "testTool" monet--tool-registry)) :handler)
-                   #'ignore))))
+    (should (eq (monet--get-tool-handler "testTool") #'ignore))))
 
 (ert-deftest monet-test-make-tool-override ()
   "Re-registering a tool replaces its handler without duplicating the entry."
@@ -54,9 +56,8 @@
                      :description "Test v2"
                      :schema '((type . "object") (properties . ()))
                      :handler #'identity)
-    (should (equal (plist-get (cdr (assoc "testTool" monet--tool-registry)) :handler)
-                   #'identity))
-    (should (= (length (seq-filter (lambda (e) (string= (car e) "testTool"))
+    (should (eq (monet--get-tool-handler "testTool") #'identity))
+    (should (= (length (seq-filter (lambda (e) (equal (cdr (car e)) "testTool"))
                                    monet--tool-registry))
                1))))
 
@@ -70,17 +71,17 @@
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
                      :set :core)
-    (should (plist-get (cdr (assoc "coreTool" monet--tool-registry)) :enabled))))
+    (should (monet--get-tool-handler "coreTool"))))
 
-(ert-deftest monet-test-diff-tools-enabled-by-default ()
-  "Tools in :diff set are enabled by default."
+(ert-deftest monet-test-simple-diff-tools-enabled-by-default ()
+  "Tools in :simple-diff set are enabled by default."
   (monet-test-with-clean-registry
     (monet-make-tool :name "diffTool"
                      :description "Test"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
-                     :set :diff)
-    (should (plist-get (cdr (assoc "diffTool" monet--tool-registry)) :enabled))))
+                     :set :simple-diff)
+    (should (monet--get-tool-handler "diffTool"))))
 
 (ert-deftest monet-test-custom-set-disabled-by-default ()
   "Tools in custom sets are disabled by default."
@@ -90,25 +91,26 @@
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
                      :set :my-package)
-    (should-not (plist-get (cdr (assoc "customTool" monet--tool-registry)) :enabled))))
+    (should-not (monet--get-tool-handler "customTool"))))
 
 (ert-deftest monet-test-override-preserves-enabled-state ()
   "Re-registering a tool preserves its current enabled state."
   (monet-test-with-clean-registry
-    ;; Register as :diff (starts enabled)
+    ;; Register as :simple-diff (starts enabled)
     (monet-make-tool :name "openDiff"
                      :description "Open a diff"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
-                     :set :diff)
-    ;; Override with :birbal (custom set, would be disabled if new)
+                     :set :simple-diff)
+    ;; Override with :birbal (same key (:simple-diff . "openDiff") replaced)
+    ;; This re-registers under the same set, preserving enabled state
     (monet-make-tool :name "openDiff"
                      :description "Birbal diff"
                      :schema '((type . "object") (properties . ()))
                      :handler #'identity
-                     :set :birbal)
+                     :set :simple-diff)
     ;; Should still be enabled (preserved from before)
-    (should (plist-get (cdr (assoc "openDiff" monet--tool-registry)) :enabled))))
+    (should (monet--get-tool-handler "openDiff"))))
 
 ;;; Enable/Disable Individual Tool Tests
 
@@ -121,7 +123,7 @@
                      :handler #'ignore
                      :set :my-package)         ; starts disabled
     (monet-enable-tool "testTool")
-    (should (plist-get (cdr (assoc "testTool" monet--tool-registry)) :enabled))))
+    (should (monet--get-tool-handler "testTool"))))
 
 (ert-deftest monet-test-disable-tool ()
   "Disable a tool by setting its :enabled flag to nil."
@@ -132,7 +134,7 @@
                      :handler #'ignore
                      :set :core)              ; starts enabled
     (monet-disable-tool "testTool")
-    (should-not (plist-get (cdr (assoc "testTool" monet--tool-registry)) :enabled))))
+    (should-not (monet--get-tool-handler "testTool"))))
 
 ;;; Enable/Disable Tool Set Tests
 
@@ -150,8 +152,8 @@
                      :handler #'ignore
                      :set :my-set)
     (monet-enable-tool-set :my-set)
-    (should (plist-get (cdr (assoc "tool1" monet--tool-registry)) :enabled))
-    (should (plist-get (cdr (assoc "tool2" monet--tool-registry)) :enabled))))
+    (should (monet--get-tool-handler "tool1"))
+    (should (monet--get-tool-handler "tool2"))))
 
 (ert-deftest monet-test-enable-tool-set-only-affects-matching ()
   "Only tools in the target set are enabled; other sets are unaffected."
@@ -167,8 +169,8 @@
                      :handler #'ignore
                      :set :set-b)
     (monet-enable-tool-set :set-a)
-    (should (plist-get (cdr (assoc "setA-tool" monet--tool-registry)) :enabled))
-    (should-not (plist-get (cdr (assoc "setB-tool" monet--tool-registry)) :enabled))))
+    (should (monet--get-tool-handler "setA-tool"))
+    (should-not (monet--get-tool-handler "setB-tool"))))
 
 (ert-deftest monet-test-disable-tool-set ()
   "Disable all tools whose current :set matches the given set keyword."
@@ -184,11 +186,11 @@
                      :handler #'ignore
                      :set :core)
     (monet-disable-tool-set :core)
-    (should-not (plist-get (cdr (assoc "tool1" monet--tool-registry)) :enabled))
-    (should-not (plist-get (cdr (assoc "tool2" monet--tool-registry)) :enabled))))
+    (should-not (monet--get-tool-handler "tool1"))
+    (should-not (monet--get-tool-handler "tool2"))))
 
 (ert-deftest monet-test-enable-tool-set-with-reset ()
-  "With RESET, all tools are disabled before the target set is enabled."
+  "Calling monet-reset-tools then monet-enable-tool-set enables only the target set."
   (monet-test-with-clean-registry
     (monet-make-tool :name "core-tool"
                      :description "Test"
@@ -201,12 +203,13 @@
                      :handler #'ignore
                      :set :other)
     (monet-enable-tool "other-tool")         ; manually enable
-    ;; Both are now enabled. Enable :core with reset.
-    (monet-enable-tool-set :core t)
+    ;; Both are now enabled. Reset then enable only :core.
+    (monet-reset-tools)
+    (monet-enable-tool-set :core)
     ;; :core tool should be enabled
-    (should (plist-get (cdr (assoc "core-tool" monet--tool-registry)) :enabled))
+    (should (monet--get-tool-handler "core-tool"))
     ;; :other tool should be disabled (reset cleared it, not re-enabled by :core)
-    (should-not (plist-get (cdr (assoc "other-tool" monet--tool-registry)) :enabled))))
+    (should-not (monet--get-tool-handler "other-tool"))))
 
 (ert-deftest monet-test-reset-tools ()
   "Every tool in the registry is disabled by monet-reset-tools."
@@ -220,42 +223,45 @@
                      :description "Test"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
-                     :set :diff)
+                     :set :simple-diff)
     (monet-reset-tools)
-    (should-not (plist-get (cdr (assoc "t1" monet--tool-registry)) :enabled))
-    (should-not (plist-get (cdr (assoc "t2" monet--tool-registry)) :enabled))))
+    (should-not (monet--get-tool-handler "t1"))
+    (should-not (monet--get-tool-handler "t2"))))
 
 ;;; Ownership Transfer Tests
 
 (ert-deftest monet-test-ownership-transfer-disable-old-set ()
   "Disabling old set does not affect tool re-registered under new set."
   (monet-test-with-clean-registry
-    ;; Register in :diff set (enabled)
+    ;; Register in :simple-diff set (enabled)
     (monet-make-tool :name "openDiff"
                      :description "Open a diff"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
-                     :set :diff)
-    ;; Register another :diff tool
+                     :set :simple-diff)
+    ;; Register another :simple-diff tool
     (monet-make-tool :name "closeAllDiffTabs"
                      :description "Close diffs"
                      :schema '((type . "object") (properties . ()))
                      :handler #'ignore
-                     :set :diff)
-    ;; Re-register openDiff as :birbal (ownership transfer)
+                     :set :simple-diff)
+    ;; Re-register openDiff as :birbal (new registry entry, since key is (set . name))
     (monet-make-tool :name "openDiff"
                      :description "Birbal diff"
                      :schema '((type . "object") (properties . ()))
                      :handler #'identity
                      :set :birbal)
-    ;; Verify ownership changed
-    (should (eq (plist-get (cdr (assoc "openDiff" monet--tool-registry)) :set) :birbal))
-    ;; Disable the :diff set
-    (monet-disable-tool-set :diff)
-    ;; openDiff should still be enabled (it's :birbal now)
-    (should (plist-get (cdr (assoc "openDiff" monet--tool-registry)) :enabled))
-    ;; closeAllDiffTabs should be disabled (still :diff)
-    (should-not (plist-get (cdr (assoc "closeAllDiffTabs" monet--tool-registry)) :enabled))))
+    ;; Verify :birbal entry for openDiff exists
+    (should (assoc '(:birbal . "openDiff") monet--tool-registry))
+    ;; Disable the :simple-diff set
+    (monet-disable-tool-set :simple-diff)
+    ;; openDiff/:birbal is disabled by default (birbal not in monet--enabled-sets),
+    ;; but it was newly registered so disabled; enable it manually to test isolation
+    (monet-enable-tool-set :birbal)
+    ;; openDiff should be enabled (it's :birbal now and :birbal is enabled)
+    (should (monet--get-tool-handler "openDiff"))
+    ;; closeAllDiffTabs should be disabled (still :simple-diff, which is now disabled)
+    (should-not (monet--get-tool-handler "closeAllDiffTabs"))))
 
 ;;; Dispatch Tests
 
@@ -339,15 +345,18 @@
   (monet-test-with-clean-registry
     (monet-register-core-tools)
     (let ((original-handler (monet--get-tool-handler "getCurrentSelection")))
-      ;; Override getCurrentSelection with a sentinel
+      ;; Override getCurrentSelection with a sentinel in a new :birbal set
       (monet-make-tool :name "getCurrentSelection"
                        :description "Custom"
                        :schema '((type . "object") (properties . ()))
                        :handler #'identity
                        :set :birbal)
+      ;; Enable :birbal so it wins the conflict resolution
+      (monet-enable-tool-set :birbal)
       ;; Verify override is active
       (should (eq (monet--get-tool-handler "getCurrentSelection") #'identity))
-      ;; Restore defaults
+      ;; Restore defaults (clears registry; monet--enabled-sets retains :birbal but
+      ;; no :birbal tools remain, so :core tools are enabled via monet--enabled-sets)
       (monet-register-core-tools)
       ;; Verify original handler is back
       (should (eq (monet--get-tool-handler "getCurrentSelection") original-handler)))))
@@ -364,7 +373,79 @@
     ;; Re-register core tools
     (monet-register-core-tools)
     ;; External tool should be gone
-    (should-not (assoc "externalTool" monet--tool-registry))))
+    (should-not (cl-find "externalTool" monet--tool-registry
+                         :key (lambda (e) (cdr (car e)))
+                         :test #'equal))))
+
+;;; Conflict Resolution Tests
+
+(ert-deftest monet-test-enable-ediff-disables-simple-diff ()
+  "Enabling :ediff disables same-named tools in :simple-diff."
+  (monet-test-with-clean-registry
+    (monet-make-tool :name "openDiff"
+                     :description "Simple diff"
+                     :schema '((type . "object") (properties . ()))
+                     :handler #'ignore
+                     :set :simple-diff)
+    (monet-make-tool :name "openDiff"
+                     :description "Ediff"
+                     :schema '((type . "object") (properties . ()))
+                     :handler #'identity
+                     :set :ediff)
+    ;; :simple-diff is in monet--enabled-sets so openDiff/:simple-diff is enabled
+    (should (eq (monet--get-tool-handler "openDiff") #'ignore))
+    ;; Enable :ediff — should disable :simple-diff's openDiff
+    (monet-enable-tool-set :ediff)
+    (should (eq (monet--get-tool-handler "openDiff") #'identity))))
+
+(ert-deftest monet-test-enable-simple-diff-disables-ediff ()
+  "Enabling :simple-diff disables same-named tools in :ediff."
+  (monet-test-with-clean-registry
+    (monet-make-tool :name "openDiff"
+                     :description "Simple diff"
+                     :schema '((type . "object") (properties . ()))
+                     :handler #'ignore
+                     :set :simple-diff)
+    (monet-make-tool :name "openDiff"
+                     :description "Ediff"
+                     :schema '((type . "object") (properties . ()))
+                     :handler #'identity
+                     :set :ediff)
+    (monet-enable-tool-set :ediff)
+    (should (eq (monet--get-tool-handler "openDiff") #'identity))
+    ;; Now re-enable :simple-diff
+    (monet-enable-tool-set :simple-diff)
+    (should (eq (monet--get-tool-handler "openDiff") #'ignore))))
+
+;;; :ediff Set Tests
+
+(ert-deftest monet-test-register-core-tools-includes-ediff ()
+  "Ediff tools are registered by monet-register-core-tools (disabled by default)."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    ;; :simple-diff's openDiff is enabled, so monet--get-tool-handler returns it
+    ;; Verify :ediff entry EXISTS in registry even though disabled:
+    (should (cl-find-if (lambda (e)
+                          (and (equal (cdr (car e)) "openDiff")
+                               (eq (plist-get (cdr e) :set) :ediff)))
+                        monet--tool-registry))))
+
+(ert-deftest monet-test-ediff-handler-returned-when-ediff-enabled ()
+  "The ediff handler is returned by monet--get-tool-handler when :ediff is enabled."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    (monet-enable-tool-set :ediff)
+    (should (eq (monet--get-tool-handler "openDiff")
+                #'monet--tool-open-ediff-handler))))
+
+(ert-deftest monet-test-simple-diff-handler-returned-after-reenabling ()
+  "Re-enabling :simple-diff after :ediff restores the simple-diff handler."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    (monet-enable-tool-set :ediff)
+    (monet-enable-tool-set :simple-diff)
+    (should (eq (monet--get-tool-handler "openDiff")
+                #'monet--tool-open-diff-handler))))
 
 ;;; Introspection Tool Registration Tests
 
@@ -372,11 +453,16 @@
   "Five tools are registered in the :introspection set."
   (monet-test-with-clean-registry
     (monet-register-emacs-tools)
-    (should (assoc "xref_find_references" monet--tool-registry))
-    (should (assoc "xref_find_definitions" monet--tool-registry))
-    (should (assoc "xref_find_apropos" monet--tool-registry))
-    (should (assoc "imenu_list_symbols" monet--tool-registry))
-    (should (assoc "treesit_info" monet--tool-registry))))
+    (should (cl-find "xref_find_references" monet--tool-registry
+                     :key (lambda (e) (cdr (car e))) :test #'equal))
+    (should (cl-find "xref_find_definitions" monet--tool-registry
+                     :key (lambda (e) (cdr (car e))) :test #'equal))
+    (should (cl-find "xref_find_apropos" monet--tool-registry
+                     :key (lambda (e) (cdr (car e))) :test #'equal))
+    (should (cl-find "imenu_list_symbols" monet--tool-registry
+                     :key (lambda (e) (cdr (car e))) :test #'equal))
+    (should (cl-find "treesit_info" monet--tool-registry
+                     :key (lambda (e) (cdr (car e))) :test #'equal))))
 
 (ert-deftest monet-test-register-emacs-tools-disabled-by-default ()
   "Introspection tools are disabled by default after registration."

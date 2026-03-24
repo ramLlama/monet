@@ -102,10 +102,16 @@ the diff buffer will not be displayed (though it remains accessible in the Claud
 
 ;;; Tool Registry
 (defvar monet--tool-registry nil
-  "Alist mapping tool name strings to tool spec plists.
-Each entry: (NAME . SPEC) where SPEC is a plist with keys :description, :schema,
-:handler, :set, and :enabled.
+  "Alist mapping (SET . NAME) cons cells to tool spec plists.
+Each entry: ((SET . NAME) . SPEC) where SPEC is a plist with keys :description,
+:schema, :handler, :set, and :enabled.
 Manage with `monet-make-tool', `monet-enable-tool', `monet-disable-tool', etc.")
+
+(defvar monet--enabled-sets '(:core :simple-diff)
+  "Sets whose tools are currently enabled (visible via MCP).
+Updated by `monet-enable-tool-set' and `monet-disable-tool-set'.
+When `monet-make-tool' registers a new tool, :enabled defaults to t
+iff the tool's set is in this list.")
 
 ;;; Data structures
 (cl-defstruct monet--session
@@ -431,7 +437,7 @@ If PARAMS is not provided, uses an empty hash table."
              (id (alist-get 'id message))
              (method (alist-get 'method message))
              (params (alist-get 'params message)))
-        
+
         (pcase method
           ;; Protocol initialization
           ("initialize"
@@ -585,7 +591,7 @@ process that will connect to the Claude server as a list."
 
     ;; Mark session as initialized
     (setf (monet--session-initialized session) t)
-    
+
     ;; Send tools/list_changed notification immediately
     (monet--send-notification
      client
@@ -602,10 +608,10 @@ _PARAMS are the notification parameters (unused).
 This is sent when Claude Code has successfully connected to the IDE."
   ;; Start the ping timer to keep connection alive
   (monet--start-ping-timer session)
-  
+
   ;; Don't send response - this is a notification, not a request
   ;; Notifications don't have an id and don't expect a response
-  
+
   ;; Send initial selection state after a short delay
   (when-let ((client (monet--session-client session)))
     (run-with-timer monet--initial-notification-delay nil
@@ -650,63 +656,151 @@ PLIST keys: :name (string), :description (string),
 Optional: :set (keyword, default :core).
 
 :set can be any keyword; packages define their own sets
-\(:birbal, :introspection, etc.).
-When :name already exists the definition is replaced and the current :enabled
-state is preserved.  For new tools, :enabled defaults to t for :core and :diff
-sets, nil for all others."
+\(:ediff, :introspection, etc.).
+The registry key is (SET . NAME).  When (SET . NAME) already exists the
+definition is replaced and the current :enabled state is preserved.
+Registering the same NAME under a different SET creates a new entry.
+For new tools, :enabled defaults to t if the tool's set is in
+`monet--enabled-sets', nil otherwise."
   (let* ((name (plist-get plist :name))
          (description (plist-get plist :description))
          (schema (plist-get plist :schema))
          (handler (plist-get plist :handler))
          (set (or (plist-get plist :set) :core))
-         (existing (assoc name monet--tool-registry))
+         (existing (assoc (cons set name) monet--tool-registry))
          (enabled (if existing
                       (plist-get (cdr existing) :enabled)
-                    (or (eq set :core) (eq set :diff))))
+                    (memq set monet--enabled-sets)))
          (spec (list :description description :schema schema
                      :handler handler :set set :enabled enabled)))
     (if existing
         (setcdr existing spec)
       (setq monet--tool-registry
-            (append monet--tool-registry (list (cons name spec)))))))
+            (append monet--tool-registry (list (cons (cons set name) spec)))))))
 
 (defun monet-enable-tool (name)
-  "Set tool NAME's enabled flag to t so it appears in tools/list."
-  (when-let ((entry (assoc name monet--tool-registry)))
+  "Set tool NAME's enabled flag to t so it appears in tools/list.
+If multiple sets register the same NAME, enables the first registered entry."
+  (when-let ((entry (cl-find name monet--tool-registry
+                              :key (lambda (e) (cdr (car e)))
+                              :test #'equal)))
     (setcdr entry (plist-put (cdr entry) :enabled t))))
 
 (defun monet-disable-tool (name)
   "Set tool NAME's enabled flag to nil.
 The tool definition remains in the registry and can be re-enabled without
-re-registering."
-  (when-let ((entry (assoc name monet--tool-registry)))
+re-registering.  If multiple sets register the same NAME, disables the first
+registered entry."
+  (when-let ((entry (cl-find name monet--tool-registry
+                              :key (lambda (e) (cdr (car e)))
+                              :test #'equal)))
     (setcdr entry (plist-put (cdr entry) :enabled nil))))
 
-(defun monet-enable-tool-set (set &optional reset)
-  "Set enabled flag to t for all tools whose current :set is SET.
-If RESET is non-nil, disable every registered tool first — equivalent to
-showing only this set."
-  (when reset
-    (monet-reset-tools))
-  (dolist (entry monet--tool-registry)
-    (let ((spec (cdr entry)))
-      (when (eq (plist-get spec :set) set)
-        (setcdr entry (plist-put spec :enabled t))))))
+(defun monet-enable-tool-set (&rest sets)
+  "Enable all tools registered in each of SETS.
+For each set, disables any same-named tools registered in other sets
+(conflict resolution), then enables all tools in that set.
+Adds each set to `monet--enabled-sets'.
+To reset before enabling, call `monet-reset-tools' first."
+  (dolist (set sets)
+    (cl-pushnew set monet--enabled-sets)
+    ;; Collect names of tools in this set
+    (let ((set-names (delq nil
+                           (mapcar (lambda (e)
+                                     (when (eq (plist-get (cdr e) :set) set)
+                                       (cdr (car e))))
+                                   monet--tool-registry))))
+      ;; Disable same-named tools in other sets
+      (dolist (entry monet--tool-registry)
+        (let ((entry-set (plist-get (cdr entry) :set))
+              (entry-name (cdr (car entry))))
+          (when (and (not (eq entry-set set))
+                     (member entry-name set-names))
+            (setcdr entry (plist-put (cdr entry) :enabled nil))))))
+    ;; Enable tools in this set
+    (dolist (entry monet--tool-registry)
+      (when (eq (plist-get (cdr entry) :set) set)
+        (setcdr entry (plist-put (cdr entry) :enabled t))))))
 
 (defun monet-disable-tool-set (set)
-  "Set enabled flag to nil for all tools whose current :set is SET.
+  "Disable all tools registered in SET.
+Removes SET from `monet--enabled-sets'.
 Only affects tools currently tagged SET — tools re-registered under a different
 set are unaffected."
+  (setq monet--enabled-sets (remq set monet--enabled-sets))
   (dolist (entry monet--tool-registry)
     (when (eq (plist-get (cdr entry) :set) set)
       (setcdr entry (plist-put (cdr entry) :enabled nil)))))
 
 (defun monet-reset-tools ()
-  "Set enabled flag to nil for every registered tool.
+  "Set enabled flag to nil for every registered tool and clear `monet--enabled-sets'.
 Use to start from a clean slate; combine with `monet-enable-tool-set' to
 selectively re-enable."
+  (setq monet--enabled-sets nil)
   (dolist (entry monet--tool-registry)
     (setcdr entry (plist-put (cdr entry) :enabled nil))))
+
+;;; Core Tool Schemas
+
+(defvar monet-get-current-selection-tool-schema
+  '((type . "object") (properties . ()))
+  "MCP inputSchema for the getCurrentSelection tool.")
+
+(defvar monet-get-latest-selection-tool-schema
+  '((type . "object") (properties . ()))
+  "MCP inputSchema for the getLatestSelection tool.")
+
+(defvar monet-get-diagnostics-tool-schema
+  '((type . "object") (properties . ((uri . ((type . "string"))))))
+  "MCP inputSchema for the getDiagnostics tool.")
+
+(defvar monet-get-open-editors-tool-schema
+  '((type . "object") (properties . ()))
+  "MCP inputSchema for the getOpenEditors tool.")
+
+(defvar monet-get-workspace-folders-tool-schema
+  '((type . "object") (properties . ()))
+  "MCP inputSchema for the getWorkspaceFolders tool.")
+
+(defvar monet-check-document-dirty-tool-schema
+  '((type . "object")
+    (properties . ((uri . ((type . "string")
+                           (description . "The file URI or path to check")))))
+    (required . ["uri"]))
+  "MCP inputSchema for the checkDocumentDirty tool.")
+
+(defvar monet-save-document-tool-schema
+  '((type . "object")
+    (properties . ((uri . ((type . "string")
+                           (description . "The file URI or path to save")))))
+    (required . ["uri"]))
+  "MCP inputSchema for the saveDocument tool.")
+
+(defvar monet-open-file-tool-schema
+  '((type . "object")
+    (properties . ((uri . ((type . "string")
+                           (description . "The file URI or path to open")))))
+    (required . ["uri"]))
+  "MCP inputSchema for the openFile tool.")
+
+(defvar monet-open-diff-tool-schema
+  '((type . "object")
+    (properties . ((old_file_path . ((type . "string")))
+                   (new_file_path . ((type . "string")))
+                   (new_file_contents . ((type . "string")))
+                   (tab_name . ((type . "string")))))
+    (required . ["old_file_path" "new_file_path" "new_file_contents"]))
+  "MCP inputSchema for the openDiff tool.")
+
+(defvar monet-close-all-diff-tabs-tool-schema
+  '((type . "object") (properties . ()))
+  "MCP inputSchema for the closeAllDiffTabs tool.")
+
+(defvar monet-close-tab-tool-schema
+  '((type . "object")
+    (properties . ((tab_name . ((type . "string")))))
+    (required . ["tab_name"]))
+  "MCP inputSchema for the close_tab tool.")
 
 (defun monet-register-core-tools ()
   "Register all built-in MCP tools with their default handlers.
@@ -717,13 +811,13 @@ Re-calling resets the registry to defaults, overwriting any overrides."
   (monet-make-tool
    :name "getCurrentSelection"
    :description "Get the current text selection or cursor position in the active editor"
-   :schema '((type . "object") (properties . ()))
+   :schema monet-get-current-selection-tool-schema
    :handler #'monet--tool-get-current-selection-handler
    :set :core)
   (monet-make-tool
    :name "getLatestSelection"
    :description "Get the latest text selection from any file"
-   :schema '((type . "object") (properties . ()))
+   :schema monet-get-latest-selection-tool-schema
    :handler #'monet--tool-get-latest-selection-handler
    :set :core)
   (monet-make-tool
@@ -732,37 +826,31 @@ Re-calling resets the registry to defaults, overwriting any overrides."
                         "do NOT use external commands, typecheckers, or lint tools to get "
                         "diagnostics, errors, or warnings. "
                         "Use this getDiagnostics IDE tool</important>")
-   :schema '((type . "object") (properties . ((uri . ((type . "string"))))))
+   :schema monet-get-diagnostics-tool-schema
    :handler #'monet--tool-get-diagnostics-handler
    :set :core)
   (monet-make-tool
    :name "getOpenEditors"
    :description "Get the list of currently open files in the editor"
-   :schema '((type . "object") (properties . ()))
+   :schema monet-get-open-editors-tool-schema
    :handler #'monet--tool-get-open-editors-handler
    :set :core)
   (monet-make-tool
    :name "getWorkspaceFolders"
    :description "Get the list of workspace folders (project directories)"
-   :schema '((type . "object") (properties . ()))
+   :schema monet-get-workspace-folders-tool-schema
    :handler #'monet--tool-get-workspace-folders-handler
    :set :core)
   (monet-make-tool
    :name "checkDocumentDirty"
    :description "Check if a document has unsaved changes"
-   :schema '((type . "object")
-             (properties . ((uri . ((type . "string")
-                                    (description . "The file URI or path to check")))))
-             (required . ["uri"]))
+   :schema monet-check-document-dirty-tool-schema
    :handler #'monet--tool-check-document-dirty-handler
    :set :core)
   (monet-make-tool
    :name "saveDocument"
    :description "Save a document to disk"
-   :schema '((type . "object")
-             (properties . ((uri . ((type . "string")
-                                    (description . "The file URI or path to save")))))
-             (required . ["uri"]))
+   :schema monet-save-document-tool-schema
    :handler #'monet--tool-save-document-handler
    :set :core)
   (monet-make-tool
@@ -770,46 +858,57 @@ Re-calling resets the registry to defaults, overwriting any overrides."
    :description (concat "Open a file in the editor. <important>Do NOT use emacs or "
                         "emacsclient to open a file. Use this IDE openFile tool to open "
                         "a file in the editor / Emacs / IDE.")
-   :schema '((type . "object")
-             (properties . ((uri . ((type . "string")
-                                    (description . "The file URI or path to open")))))
-             (required . ["uri"]))
+   :schema monet-open-file-tool-schema
    :handler #'monet--tool-open-file-handler
    :set :core)
-  ;; :diff tools — enabled by default
+  ;; :simple-diff tools — enabled by default
   (monet-make-tool
    :name "openDiff"
    :description "Open a diff view"
-   :schema '((type . "object")
-             (properties . ((old_file_path . ((type . "string")))
-                            (new_file_path . ((type . "string")))
-                            (new_file_contents . ((type . "string")))
-                            (tab_name . ((type . "string")))))
-             (required . ["old_file_path" "new_file_path" "new_file_contents"]))
+   :schema monet-open-diff-tool-schema
    :handler #'monet--tool-open-diff-handler
-   :set :diff)
+   :set :simple-diff)
   (monet-make-tool
    :name "closeAllDiffTabs"
    :description "Close all diff tabs"
-   :schema '((type . "object") (properties . ()))
+   :schema monet-close-all-diff-tabs-tool-schema
    :handler #'monet--tool-close-all-diff-tabs-handler
-   :set :diff)
+   :set :simple-diff)
   (monet-make-tool
    :name "close_tab"
    :description "Close a tab"
-   :schema '((type . "object")
-             (properties . ((tab_name . ((type . "string")))))
-             (required . ["tab_name"]))
+   :schema monet-close-tab-tool-schema
    :handler #'monet--tool-close-tab-handler
-   :set :diff))
+   :set :simple-diff)
+  ;; :ediff tools — disabled by default
+  (monet-make-tool
+   :name "openDiff"
+   :description "Open a diff view using ediff"
+   :schema monet-open-diff-tool-schema
+   :handler #'monet--tool-open-ediff-handler
+   :set :ediff)
+  (monet-make-tool
+   :name "closeAllDiffTabs"
+   :description "Close all diff tabs"
+   :schema monet-close-all-diff-tabs-tool-schema
+   :handler #'monet--tool-close-all-diff-tabs-handler
+   :set :ediff)
+  (monet-make-tool
+   :name "close_tab"
+   :description "Close a tab"
+   :schema monet-close-tab-tool-schema
+   :handler #'monet--tool-close-tab-handler
+   :set :ediff))
 
 ;;;; Tool handlers
 
 (defun monet--get-tool-handler (name)
-  "Return the handler function for enabled tool NAME, or nil if absent or disabled."
-  (when-let ((spec (alist-get name monet--tool-registry nil nil #'equal)))
-    (when (plist-get spec :enabled)
-      (plist-get spec :handler))))
+  "Return the handler function for the first enabled tool with NAME, or nil."
+  (when-let ((entry (cl-find-if (lambda (e)
+                                  (and (equal (cdr (car e)) name)
+                                       (plist-get (cdr e) :enabled)))
+                                monet--tool-registry)))
+    (plist-get (cdr entry) :handler)))
 
 ;; Tool handler adapters (convert MCP protocol to tool function calls)
 (defun monet--tool-get-current-selection-handler (_params _session)
@@ -822,81 +921,95 @@ _PARAMS and _SESSION are unused."
 _PARAMS and _SESSION are unused."
   (monet-default-get-latest-selection-tool))
 
-(defun monet--tool-open-diff-handler (params session)
-  "MCP handler for openDiff tool.
+(defun monet--make-open-diff-handler (diff-fn)
+  "Return an MCP handler for the openDiff tool that uses DIFF-FN.
+DIFF-FN is called with (OLD-FILE-PATH NEW-FILE-PATH NEW-FILE-CONTENTS
+ON-ACCEPT ON-QUIT SESSION) and must return a context alist containing
+a `cleanup-fn' key."
+  (lambda (params session)
+    (let* ((old-file-path (alist-get 'old_file_path params))
+           (new-file-path (alist-get 'new_file_path params))
+           (new-file-contents (alist-get 'new_file_contents params))
+           (tab-name (alist-get 'tab_name params))
+           ;; Capture the current buffer's file that initiated this diff
+           (initiating-file (when buffer-file-name
+                              (expand-file-name buffer-file-name)))
+           ;; Define accept callback
+           (on-accept
+            (lambda (final-contents)
+              (interactive)
+              ;; Use the passed final-contents parameter instead of closure value
+              ;; Defer the response until after Emacs is idle
+              (run-with-idle-timer 0 nil
+                                   (lambda ()
+                                     ;; Send FILE_SAVED response
+                                     (monet--complete-deferred-response
+                                      tab-name
+                                      (list (list (cons 'type "text")
+                                                  (cons 'text "FILE_SAVED"))
+                                            (list (cons 'type "text")
+                                                  (cons 'text final-contents))))))
+              ;; Update the selection after a short delay
+              (when-let ((client (monet--session-client session)))
+                (run-with-timer 0.1 nil
+                                (lambda ()
+                                  (monet--send-selection client))))))
+           ;; Define quit callback
+           (on-quit
+            (lambda ()
+              (interactive)
+              ;; Send DIFF_REJECTED response
+              (monet--complete-deferred-response
+               tab-name
+               (list (list (cons 'type "text")
+                           (cons 'text "DIFF_REJECTED"))
+                     (list (cons 'type "text")
+                           (cons 'text tab-name))))
+              ;; Schedule cleanup of the diff after sending response
+              (run-with-timer 0.2 nil
+                              (lambda ()
+                                ;; Clean up the diff
+                                (monet--cleanup-diff tab-name session)
+                                ;; Ping and update selection
+                                (when-let ((client (monet--session-client session)))
+                                  (monet--ping client)
+                                  (monet--send-selection client))))))
+           (opened-diffs (monet--session-opened-diffs session))
+           ;; Create the diff display
+           (diff-context (condition-case err
+                             (funcall diff-fn old-file-path new-file-path
+                                      new-file-contents on-accept on-quit session)
+                           (error "Diff tool failed: %s" (error-message-string err)))))
+      ;; Enhance the diff context with session information
+      (when diff-context
+        (setf (alist-get 'initiating-file diff-context) initiating-file)
+        (setf (alist-get 'session-directory diff-context) (monet--session-directory session))
+        (setf (alist-get 'tab-name diff-context) tab-name))
 
+      ;; Store the full context in hash table
+      (puthash tab-name diff-context opened-diffs)
+
+      ;; Update diff visibility if feature is enabled
+      (when monet-hide-diff-when-irrelevant
+        (run-with-idle-timer 0.01 nil #'monet--update-diff-visibility))
+
+      ;; Return deferred response indicator
+      `((deferred . t)
+        (unique-key . ,tab-name)))))
+
+(defun monet--tool-open-diff-handler (params session)
+  "MCP handler for openDiff tool using simple diff display.
 PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
 SESSION is the MCP session.
 Returns deferred response indicator."
-  (let* ((old-file-path (alist-get 'old_file_path params))
-         (new-file-path (alist-get 'new_file_path params))
-         (new-file-contents (alist-get 'new_file_contents params))
-         (tab-name (alist-get 'tab_name params))
-         ;; Capture the current buffer's file that initiated this diff
-         (initiating-file (when buffer-file-name
-                            (expand-file-name buffer-file-name)))
-         ;; Define accept callback
-         (on-accept
-          (lambda (final-contents)
-            (interactive)
-            ;; Use the passed final-contents parameter instead of closure value
-            ;; Defer the response until after Emacs is idle
-            (run-with-idle-timer 0 nil
-                                 (lambda ()
-                                   ;; Send FILE_SAVED response
-                                   (monet--complete-deferred-response
-                                    tab-name
-                                    (list (list (cons 'type "text")
-                                                (cons 'text "FILE_SAVED"))
-                                          (list (cons 'type "text")
-                                                (cons 'text final-contents))))))
-            ;; Update the selection after a short delay
-            (when-let ((client (monet--session-client session)))
-              (run-with-timer 0.1 nil
-                              (lambda ()
-                                (monet--send-selection client))))))
-         ;; Define quit callback
-         (on-quit
-          (lambda ()
-            (interactive)
-            ;; Send DIFF_REJECTED response
-            (monet--complete-deferred-response
-             tab-name
-             (list (list (cons 'type "text")
-                         (cons 'text "DIFF_REJECTED"))
-                   (list (cons 'type "text")
-                         (cons 'text tab-name))))
-            ;; Schedule cleanup of the diff after sending response
-            (run-with-timer 0.2 nil
-                            (lambda ()
-                              ;; Clean up the diff
-                              (monet--cleanup-diff tab-name session)
-                              ;; Ping and update selection
-                              (when-let ((client (monet--session-client session)))
-                                (monet--ping client)
-                                (monet--send-selection client))))))
-         (opened-diffs (monet--session-opened-diffs session))
-         ;; Create the diff display
-         (diff-context (condition-case err
-                           (monet-simple-diff-tool old-file-path new-file-path
-                                                   new-file-contents on-accept on-quit session)
-                         (error "Diff tool failed: %s" (error-message-string err)))))
-    ;; Enhance the diff context with session information
-    (when diff-context
-      (setf (alist-get 'initiating-file diff-context) initiating-file)
-      (setf (alist-get 'session-directory diff-context) (monet--session-directory session))
-      (setf (alist-get 'tab-name diff-context) tab-name))
+  (funcall (monet--make-open-diff-handler #'monet-simple-diff-tool) params session))
 
-    ;; Store the full context in hash table
-    (puthash tab-name diff-context opened-diffs)
-
-    ;; Update diff visibility if feature is enabled
-    (when monet-hide-diff-when-irrelevant
-      (run-with-idle-timer 0.01 nil #'monet--update-diff-visibility))
-
-    ;; Return deferred response indicator
-    `((deferred . t)
-      (unique-key . ,tab-name))))
+(defun monet--tool-open-ediff-handler (params session)
+  "MCP handler for openDiff tool using ediff.
+PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
+SESSION is the MCP session.
+Returns deferred response indicator."
+  (funcall (monet--make-open-diff-handler #'monet-ediff-tool) params session))
 
 (defun monet--tool-close-all-diff-tabs-handler (_params session)
   "MCP handler for closeAllDiffTabs tool.
@@ -1023,7 +1136,7 @@ _SESSION is unused."
   "Return a vector of available MCP tools from the registry."
   (apply #'vector
          (mapcar (lambda (entry)
-                   (let ((name (car entry))
+                   (let ((name (cdr (car entry)))
                          (spec (cdr entry)))
                      `((name . ,name)
                        (description . ,(plist-get spec :description))
@@ -1293,14 +1406,14 @@ ACCEPT-KEY and QUIT-KEY are the keys to bind.
 ON-ACCEPT and ON-QUIT are the callbacks to execute."
   ;; Clear any existing bindings in our mode map
   (setcdr monet-diff-mode-map nil)
-  
+
   ;; Define our keybindings in the minor mode map
   (define-key monet-diff-mode-map (kbd accept-key) on-accept)
   (define-key monet-diff-mode-map (kbd quit-key) on-quit)
-  
+
   ;; Enable our minor mode with high precedence
   (monet-diff-mode 1)
-  
+
   ;; If evil-mode is active, also define the keys for the appropriate states
   (when (and (boundp 'evil-mode) evil-mode)
     ;; Define for normal state (most common in diff buffers)
@@ -1310,7 +1423,7 @@ ON-ACCEPT and ON-QUIT are the callbacks to execute."
       ;; Also define for motion state (sometimes used in special buffers)
       (evil-local-set-key 'motion (kbd accept-key) on-accept)
       (evil-local-set-key 'motion (kbd quit-key) on-quit))
-    
+
     ;; For ediff control buffer, ensure we're in emacs state
     (when (string-match-p "\\*Ediff Control Panel\\*" (buffer-name))
       (when (fboundp 'evil-emacs-state)
@@ -1334,7 +1447,7 @@ Returns the window displaying the diff buffer."
                             (alist-get 'name tab)))))
          (current-frame (selected-frame))
          (display-action '((display-buffer-pop-up-window))))
-    
+
     ;; Check if we should skip display due to do-not-disturb mode
     (cond
      ;; If do-not-disturb is on and we're in a different tab or frame, don't display
@@ -1511,7 +1624,7 @@ Returns the diff context object."
                           (current-window-configuration)))
          (original-point (with-current-buffer ediff-buffer
                            (point)))
-         
+
          ;; Create the context alist that will hold our state
          (context (list (cons 'control-buffer nil) ; Will be set in startup hook
                         (cons 'new-buffer new-buffer)
@@ -1749,7 +1862,7 @@ Returns MCP-formatted response with editors list."
 Returns MCP-formatted response with folders list."
   (let ((folders '())
         (seen-dirs (make-hash-table :test 'equal)))
-    
+
     ;; First, add current project root if available
     (when-let ((project (project-current)))
       (let* ((project-root (project-root project))
@@ -1760,7 +1873,7 @@ Returns MCP-formatted response with folders list."
           (push `((uri . ,folder-uri)
                   (name . ,folder-name))
                 folders))))
-    
+
     ;; Then add project roots for all open files
     (dolist (buffer (buffer-list))
       (when (buffer-file-name buffer)
@@ -1777,7 +1890,7 @@ Returns MCP-formatted response with folders list."
               (push `((uri . ,folder-uri)
                       (name . ,folder-name))
                     folders))))))
-    
+
     ;; Return MCP-formatted response
     (list `((type . "text")
             (text . ,(json-encode `((folders . ,(nreverse folders)))))))))
