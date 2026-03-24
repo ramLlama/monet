@@ -190,7 +190,7 @@
     (should-not (monet--get-tool-handler "tool2"))))
 
 (ert-deftest monet-test-enable-tool-set-with-reset ()
-  "With RESET, all tools are disabled before the target set is enabled."
+  "Calling monet-reset-tools then monet-enable-tool-set enables only the target set."
   (monet-test-with-clean-registry
     (monet-make-tool :name "core-tool"
                      :description "Test"
@@ -203,8 +203,9 @@
                      :handler #'ignore
                      :set :other)
     (monet-enable-tool "other-tool")         ; manually enable
-    ;; Both are now enabled. Enable :core with reset.
-    (monet-enable-tool-set :core t)
+    ;; Both are now enabled. Reset then enable only :core.
+    (monet-reset-tools)
+    (monet-enable-tool-set :core)
     ;; :core tool should be enabled
     (should (monet--get-tool-handler "core-tool"))
     ;; :other tool should be disabled (reset cleared it, not re-enabled by :core)

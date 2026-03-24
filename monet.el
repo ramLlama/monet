@@ -696,31 +696,31 @@ registered entry."
                               :test #'equal)))
     (setcdr entry (plist-put (cdr entry) :enabled nil))))
 
-(defun monet-enable-tool-set (set &optional reset)
-  "Enable all tools registered in SET, disabling any conflicting tools in other sets.
-A conflicting tool is one with the same name registered in a different set.
-Adds SET to `monet--enabled-sets'.
-If RESET is non-nil, disable every registered tool first via `monet-reset-tools'."
-  (when reset
-    (monet-reset-tools))
-  (cl-pushnew set monet--enabled-sets)
-  ;; Collect names of tools in this set
-  (let ((set-names (delq nil
-                         (mapcar (lambda (e)
-                                   (when (eq (plist-get (cdr e) :set) set)
-                                     (cdr (car e))))
-                                 monet--tool-registry))))
-    ;; Disable same-named tools in other sets
+(defun monet-enable-tool-set (&rest sets)
+  "Enable all tools registered in each of SETS.
+For each set, disables any same-named tools registered in other sets
+(conflict resolution), then enables all tools in that set.
+Adds each set to `monet--enabled-sets'.
+To reset before enabling, call `monet-reset-tools' first."
+  (dolist (set sets)
+    (cl-pushnew set monet--enabled-sets)
+    ;; Collect names of tools in this set
+    (let ((set-names (delq nil
+                           (mapcar (lambda (e)
+                                     (when (eq (plist-get (cdr e) :set) set)
+                                       (cdr (car e))))
+                                   monet--tool-registry))))
+      ;; Disable same-named tools in other sets
+      (dolist (entry monet--tool-registry)
+        (let ((entry-set (plist-get (cdr entry) :set))
+              (entry-name (cdr (car entry))))
+          (when (and (not (eq entry-set set))
+                     (member entry-name set-names))
+            (setcdr entry (plist-put (cdr entry) :enabled nil))))))
+    ;; Enable tools in this set
     (dolist (entry monet--tool-registry)
-      (let ((entry-set (plist-get (cdr entry) :set))
-            (entry-name (cdr (car entry))))
-        (when (and (not (eq entry-set set))
-                   (member entry-name set-names))
-          (setcdr entry (plist-put (cdr entry) :enabled nil))))))
-  ;; Enable tools in this set
-  (dolist (entry monet--tool-registry)
-    (when (eq (plist-get (cdr entry) :set) set)
-      (setcdr entry (plist-put (cdr entry) :enabled t)))))
+      (when (eq (plist-get (cdr entry) :set) set)
+        (setcdr entry (plist-put (cdr entry) :enabled t))))))
 
 (defun monet-disable-tool-set (set)
   "Disable all tools registered in SET.
