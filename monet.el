@@ -130,6 +130,12 @@ iff the tool's set is in this list.")
   originating-frame                     ; Frame where session was started
   )
 
+;;; Public Session API
+
+(defun monet-session-directory (session)
+  "Return the working directory of monet SESSION."
+  (monet--session-directory session))
+
 ;;; Utility Functions
 (defun monet--generate-uuid ()
   "Generate a UUID v4 string."
@@ -921,11 +927,13 @@ _PARAMS and _SESSION are unused."
 _PARAMS and _SESSION are unused."
   (monet-default-get-latest-selection-tool))
 
-(defun monet--make-open-diff-handler (diff-fn)
+(defun monet-make-open-diff-handler (diff-fn)
   "Return an MCP handler for the openDiff tool that uses DIFF-FN.
 DIFF-FN is called with (OLD-FILE-PATH NEW-FILE-PATH NEW-FILE-CONTENTS
 ON-ACCEPT ON-QUIT SESSION) and must return a context alist containing
-a `cleanup-fn' key."
+a `cleanup-fn' key.
+ON-ACCEPT is called with the final file contents when the user accepts.
+ON-QUIT is called with no arguments when the user rejects."
   (lambda (params session)
     (let* ((old-file-path (alist-get 'old_file_path params))
            (new-file-path (alist-get 'new_file_path params))
@@ -997,19 +1005,22 @@ a `cleanup-fn' key."
       `((deferred . t)
         (unique-key . ,tab-name)))))
 
+(define-obsolete-function-alias 'monet--make-open-diff-handler
+  #'monet-make-open-diff-handler "0.0.4")
+
 (defun monet--tool-open-diff-handler (params session)
   "MCP handler for openDiff tool using simple diff display.
 PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
 SESSION is the MCP session.
 Returns deferred response indicator."
-  (funcall (monet--make-open-diff-handler #'monet-simple-diff-tool) params session))
+  (funcall (monet-make-open-diff-handler #'monet-simple-diff-tool) params session))
 
 (defun monet--tool-open-ediff-handler (params session)
   "MCP handler for openDiff tool using ediff.
 PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
 SESSION is the MCP session.
 Returns deferred response indicator."
-  (funcall (monet--make-open-diff-handler #'monet-ediff-tool) params session))
+  (funcall (monet-make-open-diff-handler #'monet-ediff-tool) params session))
 
 (defun monet--tool-close-all-diff-tabs-handler (_params session)
   "MCP handler for closeAllDiffTabs tool.
