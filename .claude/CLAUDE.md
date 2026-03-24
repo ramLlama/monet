@@ -119,7 +119,7 @@ The ERT suite in `monet-tests.el` covers the tool registry API, dispatch, enable
 emacs --batch -L . -l test-diff-visibility.el
 ```
 
-`make test` requires the `websocket` package; it looks for it at `ELPA_DIR` (defaults to `~/.emacs.d/elpa`, override as needed).
+`make test` requires the `websocket` package to be installed (via `M-x package-install RET websocket`); it is discovered automatically via `(package-initialize)`.
 
 ### Loading for Development
 ```elisp
