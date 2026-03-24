@@ -879,7 +879,26 @@ Re-calling resets the registry to defaults, overwriting any overrides."
    :description "Close a tab"
    :schema monet-close-tab-tool-schema
    :handler #'monet--tool-close-tab-handler
-   :set :simple-diff))
+   :set :simple-diff)
+  ;; :ediff tools — disabled by default
+  (monet-make-tool
+   :name "openDiff"
+   :description "Open a diff view using ediff"
+   :schema monet-open-diff-tool-schema
+   :handler #'monet--tool-open-ediff-handler
+   :set :ediff)
+  (monet-make-tool
+   :name "closeAllDiffTabs"
+   :description "Close all diff tabs"
+   :schema monet-close-all-diff-tabs-tool-schema
+   :handler #'monet--tool-close-all-diff-tabs-handler
+   :set :ediff)
+  (monet-make-tool
+   :name "close_tab"
+   :description "Close a tab"
+   :schema monet-close-tab-tool-schema
+   :handler #'monet--tool-close-tab-handler
+   :set :ediff))
 
 ;;;; Tool handlers
 
@@ -902,81 +921,95 @@ _PARAMS and _SESSION are unused."
 _PARAMS and _SESSION are unused."
   (monet-default-get-latest-selection-tool))
 
-(defun monet--tool-open-diff-handler (params session)
-  "MCP handler for openDiff tool.
+(defun monet--make-open-diff-handler (diff-fn)
+  "Return an MCP handler for the openDiff tool that uses DIFF-FN.
+DIFF-FN is called with (OLD-FILE-PATH NEW-FILE-PATH NEW-FILE-CONTENTS
+ON-ACCEPT ON-QUIT SESSION) and must return a context alist containing
+a `cleanup-fn' key."
+  (lambda (params session)
+    (let* ((old-file-path (alist-get 'old_file_path params))
+           (new-file-path (alist-get 'new_file_path params))
+           (new-file-contents (alist-get 'new_file_contents params))
+           (tab-name (alist-get 'tab_name params))
+           ;; Capture the current buffer's file that initiated this diff
+           (initiating-file (when buffer-file-name
+                              (expand-file-name buffer-file-name)))
+           ;; Define accept callback
+           (on-accept
+            (lambda (final-contents)
+              (interactive)
+              ;; Use the passed final-contents parameter instead of closure value
+              ;; Defer the response until after Emacs is idle
+              (run-with-idle-timer 0 nil
+                                   (lambda ()
+                                     ;; Send FILE_SAVED response
+                                     (monet--complete-deferred-response
+                                      tab-name
+                                      (list (list (cons 'type "text")
+                                                  (cons 'text "FILE_SAVED"))
+                                            (list (cons 'type "text")
+                                                  (cons 'text final-contents))))))
+              ;; Update the selection after a short delay
+              (when-let ((client (monet--session-client session)))
+                (run-with-timer 0.1 nil
+                                (lambda ()
+                                  (monet--send-selection client))))))
+           ;; Define quit callback
+           (on-quit
+            (lambda ()
+              (interactive)
+              ;; Send DIFF_REJECTED response
+              (monet--complete-deferred-response
+               tab-name
+               (list (list (cons 'type "text")
+                           (cons 'text "DIFF_REJECTED"))
+                     (list (cons 'type "text")
+                           (cons 'text tab-name))))
+              ;; Schedule cleanup of the diff after sending response
+              (run-with-timer 0.2 nil
+                              (lambda ()
+                                ;; Clean up the diff
+                                (monet--cleanup-diff tab-name session)
+                                ;; Ping and update selection
+                                (when-let ((client (monet--session-client session)))
+                                  (monet--ping client)
+                                  (monet--send-selection client))))))
+           (opened-diffs (monet--session-opened-diffs session))
+           ;; Create the diff display
+           (diff-context (condition-case err
+                             (funcall diff-fn old-file-path new-file-path
+                                      new-file-contents on-accept on-quit session)
+                           (error "Diff tool failed: %s" (error-message-string err)))))
+      ;; Enhance the diff context with session information
+      (when diff-context
+        (setf (alist-get 'initiating-file diff-context) initiating-file)
+        (setf (alist-get 'session-directory diff-context) (monet--session-directory session))
+        (setf (alist-get 'tab-name diff-context) tab-name))
 
+      ;; Store the full context in hash table
+      (puthash tab-name diff-context opened-diffs)
+
+      ;; Update diff visibility if feature is enabled
+      (when monet-hide-diff-when-irrelevant
+        (run-with-idle-timer 0.01 nil #'monet--update-diff-visibility))
+
+      ;; Return deferred response indicator
+      `((deferred . t)
+        (unique-key . ,tab-name)))))
+
+(defun monet--tool-open-diff-handler (params session)
+  "MCP handler for openDiff tool using simple diff display.
 PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
 SESSION is the MCP session.
 Returns deferred response indicator."
-  (let* ((old-file-path (alist-get 'old_file_path params))
-         (new-file-path (alist-get 'new_file_path params))
-         (new-file-contents (alist-get 'new_file_contents params))
-         (tab-name (alist-get 'tab_name params))
-         ;; Capture the current buffer's file that initiated this diff
-         (initiating-file (when buffer-file-name
-                            (expand-file-name buffer-file-name)))
-         ;; Define accept callback
-         (on-accept
-          (lambda (final-contents)
-            (interactive)
-            ;; Use the passed final-contents parameter instead of closure value
-            ;; Defer the response until after Emacs is idle
-            (run-with-idle-timer 0 nil
-                                 (lambda ()
-                                   ;; Send FILE_SAVED response
-                                   (monet--complete-deferred-response
-                                    tab-name
-                                    (list (list (cons 'type "text")
-                                                (cons 'text "FILE_SAVED"))
-                                          (list (cons 'type "text")
-                                                (cons 'text final-contents))))))
-            ;; Update the selection after a short delay
-            (when-let ((client (monet--session-client session)))
-              (run-with-timer 0.1 nil
-                              (lambda ()
-                                (monet--send-selection client))))))
-         ;; Define quit callback
-         (on-quit
-          (lambda ()
-            (interactive)
-            ;; Send DIFF_REJECTED response
-            (monet--complete-deferred-response
-             tab-name
-             (list (list (cons 'type "text")
-                         (cons 'text "DIFF_REJECTED"))
-                   (list (cons 'type "text")
-                         (cons 'text tab-name))))
-            ;; Schedule cleanup of the diff after sending response
-            (run-with-timer 0.2 nil
-                            (lambda ()
-                              ;; Clean up the diff
-                              (monet--cleanup-diff tab-name session)
-                              ;; Ping and update selection
-                              (when-let ((client (monet--session-client session)))
-                                (monet--ping client)
-                                (monet--send-selection client))))))
-         (opened-diffs (monet--session-opened-diffs session))
-         ;; Create the diff display
-         (diff-context (condition-case err
-                           (monet-simple-diff-tool old-file-path new-file-path
-                                                   new-file-contents on-accept on-quit session)
-                         (error "Diff tool failed: %s" (error-message-string err)))))
-    ;; Enhance the diff context with session information
-    (when diff-context
-      (setf (alist-get 'initiating-file diff-context) initiating-file)
-      (setf (alist-get 'session-directory diff-context) (monet--session-directory session))
-      (setf (alist-get 'tab-name diff-context) tab-name))
+  (funcall (monet--make-open-diff-handler #'monet-simple-diff-tool) params session))
 
-    ;; Store the full context in hash table
-    (puthash tab-name diff-context opened-diffs)
-
-    ;; Update diff visibility if feature is enabled
-    (when monet-hide-diff-when-irrelevant
-      (run-with-idle-timer 0.01 nil #'monet--update-diff-visibility))
-
-    ;; Return deferred response indicator
-    `((deferred . t)
-      (unique-key . ,tab-name))))
+(defun monet--tool-open-ediff-handler (params session)
+  "MCP handler for openDiff tool using ediff.
+PARAMS contains old_file_path, new_file_path, new_file_contents, tab_name.
+SESSION is the MCP session.
+Returns deferred response indicator."
+  (funcall (monet--make-open-diff-handler #'monet-ediff-tool) params session))
 
 (defun monet--tool-close-all-diff-tabs-handler (_params session)
   "MCP handler for closeAllDiffTabs tool.

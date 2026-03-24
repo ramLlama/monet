@@ -416,6 +416,36 @@
     (monet-enable-tool-set :simple-diff)
     (should (eq (monet--get-tool-handler "openDiff") #'ignore))))
 
+;;; :ediff Set Tests
+
+(ert-deftest monet-test-register-core-tools-includes-ediff ()
+  "Ediff tools are registered by monet-register-core-tools (disabled by default)."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    ;; :simple-diff's openDiff is enabled, so monet--get-tool-handler returns it
+    ;; Verify :ediff entry EXISTS in registry even though disabled:
+    (should (cl-find-if (lambda (e)
+                          (and (equal (cdr (car e)) "openDiff")
+                               (eq (plist-get (cdr e) :set) :ediff)))
+                        monet--tool-registry))))
+
+(ert-deftest monet-test-ediff-handler-returned-when-ediff-enabled ()
+  "The ediff handler is returned by monet--get-tool-handler when :ediff is enabled."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    (monet-enable-tool-set :ediff)
+    (should (eq (monet--get-tool-handler "openDiff")
+                #'monet--tool-open-ediff-handler))))
+
+(ert-deftest monet-test-simple-diff-handler-returned-after-reenabling ()
+  "Re-enabling :simple-diff after :ediff restores the simple-diff handler."
+  (monet-test-with-clean-registry
+    (monet-register-core-tools)
+    (monet-enable-tool-set :ediff)
+    (monet-enable-tool-set :simple-diff)
+    (should (eq (monet--get-tool-handler "openDiff")
+                #'monet--tool-open-diff-handler))))
+
 ;;; Introspection Tool Registration Tests
 
 (ert-deftest monet-test-register-emacs-tools-adds-introspection-set ()
