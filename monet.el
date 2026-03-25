@@ -215,7 +215,7 @@ iff the tool's set is in this list.")
              (content (json-encode
                        `((pid . ,(emacs-pid))
                          (workspaceFolders . ,(vector folder))
-                         (ideName . ,(format "Emacs (%s)" session-key))
+                         (ideName . ,(format "Emacs (%s @ %d)" session-key port))
                          (transport . "ws")
                          (authToken . ,auth-token)))))
         ;; Ensure directory exists
