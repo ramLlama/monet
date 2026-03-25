@@ -5,6 +5,7 @@
 
 # Compiled Emacs Lisp files
 *.elc
+monet-autoloads.el
 
 # Other common patterns
 .DS_Store

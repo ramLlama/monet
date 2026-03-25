@@ -1790,9 +1790,8 @@ SESSION is the monet session for tracking opened diffs."
           (list `((type . "text")
                 (text . "TAB_NOT_DIFF")))))
   ;; No tab name provided
-  (t
-   (list `((type . "text")
-           (text . "NO_TAB_SPECIFIED"))))))
+  (list `((type . "text")
+          (text . "NO_TAB_SPECIFIED")))))
 
 (defun monet-default-open-file-tool (uri)
   "Default implementation to open a file specified by URI.
