@@ -447,10 +447,10 @@
     (should (eq (monet--get-tool-handler "openDiff")
                 #'monet--tool-open-diff-handler))))
 
-;;; Introspection Tool Registration Tests
+;;; Emacs Tools Registration Tests
 
-(ert-deftest monet-test-register-emacs-tools-adds-introspection-set ()
-  "Five tools are registered in the :introspection set."
+(ert-deftest monet-test-register-emacs-tools-adds-emacs-tools-set ()
+  "Five tools are registered in the :emacs-tools set."
   (monet-test-with-clean-registry
     (monet-register-emacs-tools)
     (should (cl-find "xref_find_references" monet--tool-registry
@@ -473,10 +473,10 @@
     (should-not (monet--get-tool-handler "treesit_info"))))
 
 (ert-deftest monet-test-register-emacs-tools-enable-set ()
-  "Enabling :introspection set makes the tools accessible via monet--get-tool-handler."
+  "Enabling :emacs-tools set makes the tools accessible via monet--get-tool-handler."
   (monet-test-with-clean-registry
     (monet-register-emacs-tools)
-    (monet-enable-tool-set :introspection)
+    (monet-enable-tool-set :emacs-tools)
     (should (monet--get-tool-handler "xref_find_references"))
     (should (monet--get-tool-handler "xref_find_definitions"))
     (should (monet--get-tool-handler "xref_find_apropos"))
@@ -488,7 +488,7 @@
   (monet-test-with-clean-registry
     (monet-register-core-tools)
     (monet-register-emacs-tools)
-    (monet-enable-tool-set :introspection)
+    (monet-enable-tool-set :emacs-tools)
     ;; Core tools still enabled
     (should (monet--get-tool-handler "getCurrentSelection"))
     (should (monet--get-tool-handler "openDiff"))

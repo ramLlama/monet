@@ -52,7 +52,7 @@ Tools are managed via a dynamic registry (`monet--tool-registry`), an alist of `
 **Tool sets:**
 - `:core` -- enabled by default: getCurrentSelection, getLatestSelection, getDiagnostics, getOpenEditors, getWorkspaceFolders, checkDocumentDirty, saveDocument, openFile
 - `:diff` -- enabled by default: openDiff, closeAllDiffTabs, close_tab
-- `:introspection` -- disabled by default (opt-in via `monet-emacs-tools.el`)
+- `:emacs-tools` -- disabled by default (opt-in via `monet-emacs-tools.el`)
 - Custom sets -- any keyword; disabled by default on first registration
 
 **Overriding a tool (e.g. for Birbal):**
@@ -140,7 +140,7 @@ emacs --batch -L . -l test-diff-visibility.el
 
 5. **Tool customization via registry**: Override any built-in tool with `monet-make-tool`. The defcustom override variables (`monet-diff-tool`, `monet-open-file-tool`, etc.) have been removed — this is a breaking change from ≤0.0.3. Re-registering preserves `:enabled` state.
 
-6. **`monet-register-core-tools` clears everything**: It does `(setq monet--tool-registry nil)` then re-registers built-ins. Any externally registered tools (e.g. `:introspection` set) are lost. Always call extension registration functions *after* `monet-register-core-tools`.
+6. **`monet-register-core-tools` clears everything**: It does `(setq monet--tool-registry nil)` then re-registers built-ins. Any externally registered tools (e.g. `:emacs-tools` set) are lost. Always call extension registration functions *after* `monet-register-core-tools`.
 
 7. **Polymorphic diff cleanup**: `monet--cleanup-diff` calls the `cleanup-fn` stored in the diff context alist. Both `monet-simple-diff-tool` and `monet-ediff-tool` set this. Custom `openDiff` handlers must include `cleanup-fn` in their returned context or cleanup will silently fall back to `monet-simple-diff-cleanup-tool`.
 
@@ -152,7 +152,7 @@ emacs --batch -L . -l test-diff-visibility.el
 
 11. **Tab-bar integration**: Session tracks `originating-tab` for do-not-disturb mode. The code checks `tab-bar-mode` and `tab-bar--current-tab` (internal Emacs API).
 
-12. **Introspection tools are opt-in**: `monet-emacs-tools.el` must be loaded and `monet-register-emacs-tools` called, then `(monet-enable-tool-set :introspection)`. The `treesit_info` tool requires tree-sitter support (Emacs 29+ with `--with-tree-sitter`).
+12. **Emacs-specific tools are opt-in**: `monet-emacs-tools.el` must be loaded and `monet-register-emacs-tools` called, then `(monet-enable-tool-set :emacs-tools)`. The `treesit_info` tool requires tree-sitter support (Emacs 29+ with `--with-tree-sitter`).
 
 ## Context Files
 

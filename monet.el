@@ -662,7 +662,7 @@ PLIST keys: :name (string), :description (string),
 Optional: :set (keyword, default :core).
 
 :set can be any keyword; packages define their own sets
-\(:ediff, :introspection, etc.).
+\(:ediff, :emacs-tools, etc.).
 The registry key is (SET . NAME).  When (SET . NAME) already exists the
 definition is replaced and the current :enabled state is preserved.
 Registering the same NAME under a different SET creates a new entry.

@@ -160,7 +160,7 @@ Monet uses a dynamic tool registry to manage all MCP tools. Tools are organized 
 
 - **`:core`** (enabled by default): `getCurrentSelection`, `getLatestSelection`, `getDiagnostics`, `getOpenEditors`, `getWorkspaceFolders`, `checkDocumentDirty`, `saveDocument`, `openFile`
 - **`:diff`** (enabled by default): `openDiff`, `closeAllDiffTabs`, `close_tab`
-- **`:introspection`** (disabled by default, opt-in via `monet-emacs-tools.el`): `xref_find_definitions`, `xref_find_references`, `imenu_list_symbols`, `treesit_info`
+- **`:emacs-tools`** (disabled by default, opt-in via `monet-emacs-tools.el`): `xref_find_definitions`, `xref_find_references`, `imenu_list_symbols`, `treesit_info`
 
 #### Overriding a Tool
 
@@ -198,7 +198,7 @@ Register entirely new tools under a custom set:
 
 ```elisp
 ;; Enable/disable entire sets
-(monet-enable-tool-set :introspection)
+(monet-enable-tool-set :emacs-tools)
 (monet-disable-tool-set :diff)
 
 ;; Enable/disable individual tools
@@ -242,7 +242,7 @@ To enable:
 ```elisp
 (require 'monet-emacs-tools)
 (monet-register-emacs-tools)
-(monet-enable-tool-set :introspection)
+(monet-enable-tool-set :emacs-tools)
 ```
 
 Or enable individual tools:

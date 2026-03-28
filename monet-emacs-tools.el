@@ -5,12 +5,12 @@
 
 ;;; Commentary:
 ;; Provides Emacs introspection tools (xref, imenu, treesit) as an opt-in
-;; extension to Monet.  Tools are registered in the :introspection set, which
+;; extension to Monet.  Tools are registered in the :emacs-tools set, which
 ;; is disabled by default.
 ;;
 ;; To activate all introspection tools:
 ;;   (monet-register-emacs-tools)
-;;   (monet-enable-tool-set :introspection)
+;;   (monet-enable-tool-set :emacs-tools)
 ;;
 ;; Or enable individual tools:
 ;;   (monet-register-emacs-tools)
@@ -305,9 +305,9 @@ _SESSION is unused."
 
 ;;;###autoload
 (defun monet-register-emacs-tools ()
-  "Register Emacs introspection tools in the :introspection set.
+  "Register Emacs introspection tools in the :emacs-tools set.
 Tools are disabled by default; activate with:
-  (monet-enable-tool-set :introspection)
+  (monet-enable-tool-set :emacs-tools)
 or enable individual tools with `monet-enable-tool'."
   (interactive)
   (monet-make-tool
@@ -320,7 +320,7 @@ or enable individual tools with `monet-enable-tool'."
                                          (description . "File to establish xref context")))))
              (required . ["identifier" "file_path"]))
    :handler #'monet-emacs-tools--xref-find-references-handler
-   :set :introspection)
+   :set :emacs-tools)
   (monet-make-tool
    :name "xref_find_definitions"
    :description "Find the definition of a symbol using xref."
@@ -331,7 +331,7 @@ or enable individual tools with `monet-enable-tool'."
                                          (description . "File to establish xref context")))))
              (required . ["identifier" "file_path"]))
    :handler #'monet-emacs-tools--xref-find-definitions-handler
-   :set :introspection)
+   :set :emacs-tools)
   (monet-make-tool
    :name "xref_find_apropos"
    :description "Search for symbols matching a pattern using xref apropos."
@@ -342,7 +342,7 @@ or enable individual tools with `monet-enable-tool'."
                                          (description . "File to establish xref context")))))
              (required . ["pattern" "file_path"]))
    :handler #'monet-emacs-tools--xref-find-apropos-handler
-   :set :introspection)
+   :set :emacs-tools)
   (monet-make-tool
    :name "imenu_list_symbols"
    :description "List all symbols in a file using imenu."
@@ -351,7 +351,7 @@ or enable individual tools with `monet-enable-tool'."
                                           (description . "File to list symbols from")))))
              (required . ["file_path"]))
    :handler #'monet-emacs-tools--imenu-list-symbols-handler
-   :set :introspection)
+   :set :emacs-tools)
   (monet-make-tool
    :name "treesit_info"
    :description (concat "Get tree-sitter syntax tree information for a file or point. "
@@ -371,7 +371,7 @@ or enable individual tools with `monet-enable-tool'."
                                                  (description . "Include child nodes")))))
              (required . ["file_path"]))
    :handler #'monet-emacs-tools--treesit-info-handler
-   :set :introspection))
+   :set :emacs-tools))
 
 (provide 'monet-emacs-tools)
 ;;; monet-emacs-tools.el ends here
