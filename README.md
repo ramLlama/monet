@@ -1,5 +1,7 @@
 # Monet
 
+> **Note:** This is a fork of [stevemolitor/monet](https://github.com/stevemolitor/monet) with significant, incompatible changes — most notably the replacement of `defcustom` tool variables with a dynamic tool registry API. If you're looking for the original project compatible with [claude-code.el](https://github.com/stevemolitor/claude-code.el), head there.
+
 ![Claude Monet Self Portrait](https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/Autoportret_Claude_Monet.jpg/512px-Autoportret_Claude_Monet.jpg)
 
 <sub>Self Portrait with a Beret, 1886 by Claude Monet. Source: Wikimedia Commons</sub>
@@ -15,6 +17,8 @@ You can use Monet with Claude Code running in your favorite terminal emulator (G
 - Create diff views in Emacs before Claude applies changes
 - Project-aware session management
 - Multiple concurrent sessions support
+- Dynamic tool registry for overriding or extending MCP tools
+- Optional introspection tools (xref, imenu, tree-sitter)
 
 ## Requirements
 
@@ -27,21 +31,21 @@ You can use Monet with Claude Code running in your favorite terminal emulator (G
 
 ```elisp
 (use-package monet
-  :vc (:url "https://github.com/stevemolitor/monet" :rev :newest))
+  :vc (:url "https://github.com/ramLlama/monet" :rev :newest))
 ```
 
 ### Using straight.el
 
 ```elisp
 (straight-use-package
- '(monet :type git :host github :repo "stevemolitor/monet"))
+ '(monet :type git :host github :repo "ramLlama/monet"))
 ```
 
 ### Manual Installation
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/stevemolitor/monet.git
+   git clone https://github.com/ramLlama/monet.git
    ```
 
 2. Add to your Emacs configuration:
@@ -74,22 +78,18 @@ If you have multiple Monet sessions for the same project you can do this to have
 ENABLE_IDE_INTEGRATION=t && CLAUDE_CODE_SSE_PORT=123456 && claude
 ```
 
-Monet prints a message with the port number when you call `monet-start-server` (`C-c m s`). You can see the list of all running servers with their ports and directories via `monet-list-sessions` (`C-c m l`). 
-
-### Using Monet with [claude-code.el](https://github.com/stevemolitor/claude-code.el)
-
-You can use Monet with [claude-code.el](https://github.com/stevemolitor/claude-code.el) by adding this hook:
-
-
-```elisp
-(add-hook 'claude-code-process-environment-functions #'monet-start-server-function)
-```
-
-When claude-code.el starts a new session it will start and associate a Monet session with the current claude-code.el instance. 
+Monet prints a message with the port number when you call `monet-start-server` (`C-c m s`). You can see the list of all running servers with their ports and directories via `monet-list-sessions` (`C-c m l`).
 
 ### Session Management
 
-Sessions are automatically cleaned up (killed) when you exit the associated Claude session. When you exit Emacs all sessions are cleaned up. You can stop a session manually via `monet-stop-server` (`C-c q`).
+Sessions are automatically cleaned up (killed) when you exit the associated Claude session. When you exit Emacs all sessions are cleaned up. You can stop a session manually via `monet-stop-server` (`C-c m q`).
+
+Monet automatically creates session keys based on your context:
+- When in a project (via `project.el`), uses the project name
+- Otherwise, uses the current directory name
+- Automatically generates unique keys for multiple sessions (e.g., `project<2>`)
+
+With a prefix argument (`C-u C-c m s`), you can manually select a directory.
 
 ### Example
 
@@ -115,7 +115,7 @@ When Claude proposes code changes, Monet displays them in a diff view:
 - **Simple Diff Tool** (default): A read-only diff view showing the proposed changes
   - Press `y` to accept Claude's changes exactly as shown
   - Press `q` to reject the changes
-  
+
 - **Ediff Tool**: An interactive diff view that allows you to edit the changes before accepting
   - Navigate between differences using `n` (next) and `p` (previous)
   - Edit the proposed changes directly in the buffer
@@ -123,17 +123,6 @@ When Claude proposes code changes, Monet displays them in a diff view:
   - Press `q` to reject all changes
 
 **Important**: With the ediff tool, any manual edits you make to the proposed changes are captured and sent to Claude when you accept. This allows you to refine Claude's suggestions before applying them.
-
-### Session Management
-
-Monet automatically creates session keys based on your context:
-- When in a project (via `project.el`), uses the project name
-- Otherwise, uses the current directory name
-- Automatically generates unique keys for multiple sessions (e.g., `project<2>`)
-
-With a prefix argument (`C-u C-c m s`), you can manually select a directory.
-
-You can start multiple sessions per project, or have multiple 
 
 ### Customization
 
@@ -155,65 +144,114 @@ You can start multiple sessions per project, or have multiple
 
 ;; Change ediff window split direction
 (setq monet-ediff-split-window-direction 'vertical)  ; Default: 'horizontal
+
+;; Hide diff buffers when editing unrelated files
+(setq monet-hide-diff-when-irrelevant t)
+
+;; Don't display diff buffers in tabs other than the originating tab
+(setq monet-do-not-disturb t)
 ```
 
-#### Customizing MCP Tools
+### Tool Registry
 
-Most MCP tools that Claude uses to interact with Emacs are now customizable. You can replace the default implementations with your own functions:
+Monet uses a dynamic tool registry to manage all MCP tools. Tools are organized into **sets** identified by keywords.
+
+#### Built-in Tool Sets
+
+- **`:core`** (enabled by default): `getCurrentSelection`, `getLatestSelection`, `getDiagnostics`, `getOpenEditors`, `getWorkspaceFolders`, `checkDocumentDirty`, `saveDocument`, `openFile`
+- **`:diff`** (enabled by default): `openDiff`, `closeAllDiffTabs`, `close_tab`
+- **`:introspection`** (disabled by default, opt-in via `monet-emacs-tools.el`): `xref_find_definitions`, `xref_find_references`, `imenu_list_symbols`, `treesit_info`
+
+#### Overriding a Tool
+
+Replace any built-in tool by re-registering it with `monet-make-tool`:
 
 ```elisp
-;; Custom file opener that confirms before opening
-(defun my-open-file-tool (uri)
-  (when (y-or-n-p (format "Open %s? " uri))
-    (monet-default-open-file-tool uri)))
-(setq monet-open-file-tool 'my-open-file-tool)
-
-;; Custom diagnostics that only reports errors
-(defun my-diagnostics-tool (&optional uri)
-  (let ((result (monet-flymake-flycheck-diagnostics-tool uri)))
-    ;; Filter to only errors... 
-    result))
-(setq monet-diagnostics-tool 'my-diagnostics-tool)
+;; Use ediff instead of the default simple diff
+(monet-make-tool :name "openDiff"
+                 :description "Show diff in ediff"
+                 :schema monet-open-diff-tool-schema
+                 :handler (monet-make-open-diff-handler #'monet-ediff-tool)
+                 :set :diff)
 ```
 
-Available customizable tools:
-- `monet-get-current-selection-tool` - Get current text selection
-- `monet-get-latest-selection-tool` - Get latest selection from any file
-- `monet-open-file-tool` - Open files in the editor
-- `monet-save-document-tool` - Save documents to disk
-- `monet-check-document-dirty-tool` - Check for unsaved changes
-- `monet-get-open-editors-tool` - List open files
-- `monet-get-workspace-folders-tool` - List project directories
-- `monet-diagnostics-tool` - Get diagnostics (defaults to Flymake/Flycheck)
+Re-registering with the same `(set . name)` key replaces the definition while preserving its current enabled state.
 
-_Important:_ to customize the diff tool to use ediff, you must set both the diff tool and the diff cleanup tool:
+#### Custom Tools
+
+Register entirely new tools under a custom set:
 
 ```elisp
-(setq monet-diff-tool #'monet-ediff-tool)
-(setq monet-diff-cleanup-tool #'monet-ediff-cleanup-tool)
+(monet-make-tool :name "myCustomTool"
+                 :description "Does something custom"
+                 :schema '((type . "object")
+                           (properties . ((input . ((type . "string")
+                                                    (description . "Input value"))))))
+                 :handler #'my-custom-handler
+                 :set :my-tools)
+
+;; Enable your custom tool set
+(monet-enable-tool-set :my-tools)
 ```
 
-#### Custom Diff Tool
-
-You can customize how Monet displays diffs by providing your own diff tool functions:
+#### Managing Tool Sets
 
 ```elisp
-;; Use a custom diff tool
-(setq monet-diff-tool 'my-diff-tool)
-(setq monet-diff-cleanup-tool 'my-diff-cleanup)
+;; Enable/disable entire sets
+(monet-enable-tool-set :introspection)
+(monet-disable-tool-set :diff)
+
+;; Enable/disable individual tools
+(monet-enable-tool "getDiagnostics")
+(monet-disable-tool "getDiagnostics")
+
+;; Reset all tools to disabled
+(monet-reset-tools)
+
+;; Restore all built-in tools to defaults (clears custom tools!)
+(monet-register-core-tools)
 ```
 
-The diff tool function should take: `(old-file-path new-file-path new-file-contents on-accept on-quit)` and return a context object. The cleanup function takes that context object for cleanup.
+**Note:** `monet-register-core-tools` clears the entire registry and re-registers built-ins. Any custom tools (e.g. from `monet-emacs-tools.el`) must be re-registered after calling it.
 
-#### Disabling Diff Tools
+#### Default Tool Implementations
 
-To disable Monet's diff functionality entirely and use Claude's built-in diff display instead:
+Each built-in tool delegates to a public `monet-default-*` or `monet-*-tool` function. These are useful as building blocks when writing custom handlers:
+
+- `monet-default-get-current-selection-tool`
+- `monet-default-get-latest-selection-tool`
+- `monet-default-open-file-tool`
+- `monet-default-save-document-tool`
+- `monet-default-check-document-dirty-tool`
+- `monet-default-get-open-editors-tool`
+- `monet-default-get-workspace-folders-tool`
+- `monet-flymake-flycheck-diagnostics-tool`
+- `monet-simple-diff-tool` / `monet-simple-diff-cleanup-tool`
+- `monet-ediff-tool` / `monet-ediff-cleanup-tool`
+
+### Introspection Tools (optional)
+
+`monet-emacs-tools.el` provides additional tools that expose Emacs introspection capabilities to Claude:
+
+- **xref_find_definitions** / **xref_find_references** — jump-to-definition and find-references via xref backends
+- **imenu_list_symbols** — list symbols in a file via imenu
+- **treesit_info** — tree-sitter node info at a position (requires Emacs 29+ with tree-sitter)
+
+To enable:
 
 ```elisp
-(setq monet-diff-tool nil)
+(require 'monet-emacs-tools)
+(monet-register-emacs-tools)
+(monet-enable-tool-set :introspection)
 ```
 
-When disabled, Claude will show proposed changes in its native interface rather than creating diff views in Emacs.
+Or enable individual tools:
+
+```elisp
+(require 'monet-emacs-tools)
+(monet-register-emacs-tools)
+(monet-enable-tool "imenu_list_symbols")
+```
 
 ## How It Works
 
