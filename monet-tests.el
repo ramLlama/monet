@@ -533,5 +533,117 @@
       (should (cl-some (lambda (s) (string-match "foo" s)) result))
       (should (cl-some (lambda (s) (string-match "bar" s)) result)))))
 
+;;; Claude Code Lifecycle Hook Tests
+
+(defmacro monet-test-with-clean-hooks (&rest body)
+  "Execute BODY with an isolated `monet--claude-hook-functions' list."
+  (declare (indent 0))
+  `(let ((monet--claude-hook-functions nil))
+     ,@body))
+
+(ert-deftest monet-test-add-claude-hook-handler ()
+  "Adding a handler registers it in monet--claude-hook-functions."
+  (monet-test-with-clean-hooks
+    (monet-add-claude-hook-handler #'ignore)
+    (should (memq #'ignore monet--claude-hook-functions))))
+
+(ert-deftest monet-test-add-claude-hook-handler-idempotent ()
+  "Adding the same handler twice does not duplicate it."
+  (monet-test-with-clean-hooks
+    (monet-add-claude-hook-handler #'ignore)
+    (monet-add-claude-hook-handler #'ignore)
+    (should (= 1 (length monet--claude-hook-functions)))))
+
+(ert-deftest monet-test-remove-claude-hook-handler ()
+  "Removing a handler deregisters it."
+  (monet-test-with-clean-hooks
+    (monet-add-claude-hook-handler #'ignore)
+    (monet-remove-claude-hook-handler #'ignore)
+    (should (null monet--claude-hook-functions))))
+
+(ert-deftest monet-test-claude-hook-receive-dispatches ()
+  "monet-claude-hook-receive calls each registered handler with event and data."
+  (monet-test-with-clean-hooks
+    (let ((received nil))
+      (monet-add-claude-hook-handler
+       (lambda (event data) (push (cons event data) received)))
+      (let ((tmpfile (make-temp-file "monet-hook-test-" nil ".json")))
+        (unwind-protect
+            (progn
+              (with-temp-file tmpfile
+                (insert "{\"hook_event_name\": \"Stop\", \"cwd\": \"/tmp\"}"))
+              (monet-claude-hook-receive tmpfile)
+              (should (= 1 (length received)))
+              (should (equal "Stop" (car (car received))))
+              (should (equal "/tmp"
+                             (cdr (assq 'cwd (cdr (car received)))))))
+          (ignore-errors (delete-file tmpfile)))))))
+
+(ert-deftest monet-test-claude-hook-receive-handler-error-isolated ()
+  "A failing handler does not prevent subsequent handlers from running."
+  (monet-test-with-clean-hooks
+    (let ((second-called nil))
+      ;; Push in reverse order because monet-add-claude-hook-handler prepends
+      (monet-add-claude-hook-handler
+       (lambda (_e _d) (setq second-called t)))
+      (monet-add-claude-hook-handler
+       (lambda (_e _d) (error "intentional test error")))
+      (let ((tmpfile (make-temp-file "monet-hook-test-" nil ".json")))
+        (unwind-protect
+            (progn
+              (with-temp-file tmpfile
+                (insert "{\"hook_event_name\": \"Stop\"}"))
+              (monet-claude-hook-receive tmpfile)
+              (should second-called))
+          (ignore-errors (delete-file tmpfile)))))))
+
+(ert-deftest monet-test-claude-hook-receive-missing-file ()
+  "monet-claude-hook-receive silently returns when file does not exist."
+  (monet-test-with-clean-hooks
+    ;; Should not signal an error
+    (should-not (monet-claude-hook-receive "/nonexistent/path/hook.json"))))
+
+(ert-deftest monet-test-install-remove-claude-hooks ()
+  "monet-install-claude-hooks writes entries; monet-remove-claude-hooks removes them."
+  (let ((tmpdir (make-temp-file "monet-settings-test-" t))
+        (script-path (monet--claude-hook-script-path)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'monet--claude-settings-path)
+                   (lambda () (expand-file-name "settings.json" tmpdir))))
+          ;; Install
+          (monet-install-claude-hooks)
+          (let* ((settings (json-read-file (monet--claude-settings-path)))
+                 (hooks (cdr (assq 'hooks settings))))
+            (dolist (event '(Stop SubagentStop Notification))
+              (let* ((event-list (append (cdr (assq event hooks)) nil))
+                     (commands (mapcar #'monet--hook-entry-command event-list)))
+                (should (member script-path commands)))))
+          ;; Remove
+          (monet-remove-claude-hooks)
+          (let* ((settings (json-read-file (monet--claude-settings-path)))
+                 (hooks (cdr (assq 'hooks settings))))
+            (dolist (event '(Stop SubagentStop Notification))
+              (let* ((event-list (append (cdr (assq event hooks)) nil))
+                     (commands (mapcar #'monet--hook-entry-command event-list)))
+                (should-not (member script-path commands))))))
+      (ignore-errors (delete-directory tmpdir t)))))
+
+(ert-deftest monet-test-install-claude-hooks-idempotent ()
+  "monet-install-claude-hooks does not duplicate entries on repeated calls."
+  (let ((tmpdir (make-temp-file "monet-settings-test-" t))
+        (script-path (monet--claude-hook-script-path)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'monet--claude-settings-path)
+                   (lambda () (expand-file-name "settings.json" tmpdir))))
+          (monet-install-claude-hooks)
+          (monet-install-claude-hooks)
+          (let* ((settings (json-read-file (monet--claude-settings-path)))
+                 (hooks (cdr (assq 'hooks settings))))
+            (dolist (event '(Stop SubagentStop Notification))
+              (let* ((event-list (append (cdr (assq event hooks)) nil))
+                     (commands (mapcar #'monet--hook-entry-command event-list)))
+                (should (= 1 (cl-count script-path commands :test #'equal)))))))
+      (ignore-errors (delete-directory tmpdir t)))))
+
 (provide 'monet-tests)
 ;;; monet-tests.el ends here
