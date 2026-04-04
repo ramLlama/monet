@@ -3,9 +3,9 @@ EMACS ?= emacs
 # Run all tests by default.
 MATCH ?=
 
-.PHONY: test clean
+.PHONY: test clean checkdoc compile pre-commit
 
-default: all
+default: compile
 
 # Remove compiled files
 clean:
@@ -27,4 +27,4 @@ test:
 		-l monet-tests.el \
 		$(if $(MATCH),--eval "(ert-run-tests-batch-and-exit \"$(MATCH)\")",-f ert-run-tests-batch-and-exit)
 
-all: checkdoc compile
+pre-commit: checkdoc test
