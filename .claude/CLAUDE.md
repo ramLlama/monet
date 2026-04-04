@@ -17,10 +17,11 @@ Monet is an Emacs package that implements the (undocumented) Claude Code IDE pro
 
 ```
 monet/
-  monet.el                      # Core implementation (~2160 lines)
+  monet.el                      # Core implementation (~2435 lines)
   monet-emacs-tools.el          # Opt-in introspection tools (xref, imenu, treesit)
-  monet-tests.el                # ERT test suite (30 tests)
-  Makefile                      # Build: checkdoc + byte-compile + test targets
+  monet-tests.el                # ERT test suite (43 tests)
+  monet-claude-hook.py          # Claude Code lifecycle hook script (replaces .sh)
+  Makefile                      # Build: checkdoc + byte-compile + test + pre-commit
   README.md                     # User-facing documentation
   CHANGELOG.md                  # Version history (currently at 0.0.3)
   LICENSE                       # Project license
@@ -51,7 +52,7 @@ Tools are managed via a dynamic registry (`monet--tool-registry`), an alist of `
 
 **Tool sets:**
 - `:core` -- enabled by default: getCurrentSelection, getLatestSelection, getDiagnostics, getOpenEditors, getWorkspaceFolders, checkDocumentDirty, saveDocument, openFile
-- `:diff` -- enabled by default: openDiff, closeAllDiffTabs, close_tab
+- `:simple-diff` -- enabled by default: openDiff, closeAllDiffTabs, close_tab
 - `:emacs-tools` -- disabled by default (opt-in via `monet-emacs-tools.el`)
 - Custom sets -- any keyword; disabled by default on first registration
 
@@ -109,7 +110,8 @@ make clean        # Remove .elc files
 
 ### Testing
 ```bash
-make test         # Run ERT test suite (monet-tests.el, 30 tests)
+make test         # Run ERT test suite (monet-tests.el, 43 tests)
+make pre-commit   # checkdoc + test (also run by the git pre-commit hook)
 ```
 
 The ERT suite in `monet-tests.el` covers the tool registry API, dispatch, enable/disable semantics, ownership transfer, and introspection tool formatting. Tests use the `monet-test-with-clean-registry` macro to isolate the global registry.
@@ -152,9 +154,25 @@ emacs --batch -L . -l test-diff-visibility.el
 
 11. **Tab-bar integration**: Session tracks `originating-tab` for do-not-disturb mode. The code checks `tab-bar-mode` and `tab-bar--current-tab` (internal Emacs API).
 
-12. **Emacs-specific tools are opt-in**: `monet-emacs-tools.el` must be loaded and `monet-register-emacs-tools` called, then `(monet-enable-tool-set :emacs-tools)`. The `treesit_info` tool requires tree-sitter support (Emacs 29+ with `--with-tree-sitter`).
+12. **Claude Code lifecycle hooks use a Python script** (`monet-claude-hook.py`).  It
+    wraps the raw JSON payload and `MONET_CTX_*` env vars into a
+    `{"hook_payload": ..., "monet_context": ...}` envelope and delivers it to
+    `monet-claude-hook-receive` via `emacsclient`.  Handlers receive three args:
+    `(event-name data ctx)`.  See [hooks.md](hooks.md) for full details.
+
+13. **Hook handler signature is 3-arg** `(event-name data ctx)` — not 2-arg.  Any
+    handler registered via `monet-add-claude-hook-handler` must accept all three.
+    The `ctx` alist keys are `MONET_CTX_*` env var names with the prefix stripped
+    and lowercased (e.g. `MONET_CTX_BATON_SESSION` → symbol `baton_session`).
+
+14. **Hook logging shares the MCP logging toggle**.  `monet--log-hook` writes to
+    `*Monet Log*` only when `monet--logging-enabled` is non-nil.  Use
+    `M-x monet-enable-logging` / `monet-disable-logging` to control both.
+
+15. **Emacs-specific tools are opt-in**: `monet-emacs-tools.el` must be loaded and `monet-register-emacs-tools` called, then `(monet-enable-tool-set :emacs-tools)`. The `treesit_info` tool requires tree-sitter support (Emacs 29+ with `--with-tree-sitter`).
 
 ## Context Files
 
 - [Architecture Details](architecture.md)
 - [Style Guide](style-guide.md)
+- [Claude Code Lifecycle Hooks](hooks.md)

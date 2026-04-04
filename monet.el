@@ -2103,34 +2103,59 @@ FRAME is the websocket frame containing the message."
   (advice-remove 'monet--on-message #'monet--advice-on-message)
   (message "Monet logging disabled"))
 
+;;; Hook Logging
+
+(defun monet--log-hook (event-name data ctx)
+  "Log a Claude Code lifecycle hook event to `monet-log-buffer-name'.
+EVENT-NAME is the hook_event_name string, DATA is the payload alist,
+and CTX is the monet_context alist.  Writes only when
+`monet--logging-enabled' is non-nil, so `monet-enable-logging' and
+`monet-disable-logging' control both MCP traffic and hook logging."
+  (when monet--logging-enabled
+    (let ((timestamp (format-time-string "%Y-%m-%d %H:%M:%S"))
+          (log-buffer (get-buffer-create monet-log-buffer-name)))
+      (with-current-buffer log-buffer
+        (goto-char (point-max))
+        (insert "----------\n")
+        (insert (format "[%s] HOOK event=%s data=%S ctx=%S\n" timestamp event-name data ctx))
+        (insert "----------\n")
+        (when-let ((window (get-buffer-window log-buffer)))
+          (with-selected-window window
+            (goto-char (point-max))))))))
+
 ;;; Claude Code Lifecycle Hooks
 
 (defvar monet--claude-hook-functions nil
   "List of functions called when a Claude Code lifecycle event fires.
-Each function receives (EVENT-NAME DATA-ALIST) where EVENT-NAME is a
-string (e.g. \"Stop\", \"Notification\") and DATA-ALIST is the parsed
-JSON payload from the hook.")
+Each function receives (EVENT-NAME DATA CTX) where EVENT-NAME is a
+string (e.g. \"Stop\", \"Notification\"), DATA is the parsed JSON
+payload from the hook, and CTX is an alist of MONET_CTX_* environment
+variables injected at Claude Code spawn time (keys lowercased, prefix
+stripped).")
 
 (defun monet-claude-hook-receive (json-file)
   "Receive a Claude Code lifecycle event from JSON-FILE.
-
-Called by the monet-claude-hook.sh shell script via emacsclient.
-Reads JSON-FILE, extracts the hook_event_name field, and calls each
-function in `monet--claude-hook-functions' with (EVENT-NAME DATA-ALIST).
+JSON-FILE contains {\"hook_payload\": {...}, \"monet_context\": {...}}.
+Called by the monet-claude-hook.py script via emacsclient.
+Reads JSON-FILE, extracts hook_event_name, and calls each function in
+`monet--claude-hook-functions' with (EVENT-NAME DATA CTX).
 Per-handler errors are caught so a failing handler does not block others."
   (when (file-readable-p json-file)
-    (let* ((data (json-read-file json-file))
+    (let* ((envelope   (json-read-file json-file))
+           (data       (cdr (assq 'hook_payload  envelope)))
+           (ctx        (cdr (assq 'monet_context envelope)))
            (event-name (cdr (assq 'hook_event_name data))))
+      (monet--log-hook event-name data ctx)
       (dolist (handler monet--claude-hook-functions)
         (condition-case err
-            (funcall handler event-name data)
+            (funcall handler event-name data ctx)
           (error
            (message "monet-claude-hook-receive: handler %s error: %s"
                     handler (error-message-string err))))))))
 
 (defun monet-add-claude-hook-handler (handler)
   "Register HANDLER as a Claude Code lifecycle event handler.
-HANDLER is a function called with (EVENT-NAME DATA-ALIST).
+HANDLER is a function called with (EVENT-NAME DATA CTX).
 No-op if HANDLER is already registered."
   (unless (memq handler monet--claude-hook-functions)
     (push handler monet--claude-hook-functions)))
@@ -2141,8 +2166,8 @@ No-op if HANDLER is already registered."
         (delq handler monet--claude-hook-functions)))
 
 (defun monet--claude-hook-script-path ()
-  "Return the absolute path to monet-claude-hook.sh."
-  (expand-file-name "monet-claude-hook.sh"
+  "Return the absolute path to monet-claude-hook.py."
+  (expand-file-name "monet-claude-hook.py"
                     (file-name-directory (locate-library "monet"))))
 
 (defun monet--claude-settings-path ()
@@ -2179,15 +2204,16 @@ The inner hooks value may be a vector (after JSON round-trip) or a list;
 
 (defun monet-install-claude-hooks ()
   "Install monet lifecycle hook entries in ~/.claude/settings.json.
-Adds Stop, SubagentStop, and Notification entries pointing to
-monet-claude-hook.sh.  Idempotent: existing entries are not duplicated."
+Adds Stop, SubagentStop, Notification, and UserPromptSubmit entries
+pointing to monet-claude-hook.py.  Idempotent: existing entries are
+not duplicated."
   (interactive)
   (let* ((script-path (monet--claude-hook-script-path))
          (settings (or (monet--read-claude-settings) '()))
          (hooks-cell (assq 'hooks settings))
          (hooks (if hooks-cell (cdr hooks-cell) '()))
          (new-entry (monet--hook-entry script-path))
-         (event-names '(Stop SubagentStop Notification)))
+         (event-names '(Stop SubagentStop Notification UserPromptSubmit)))
     (dolist (event event-names)
       (let* ((existing-cell (assq event hooks))
              (existing-list (if existing-cell
@@ -2210,8 +2236,8 @@ monet-claude-hook.sh.  Idempotent: existing entries are not duplicated."
 
 (defun monet-remove-claude-hooks ()
   "Remove monet's lifecycle hook entries from ~/.claude/settings.json.
-Removes Stop, SubagentStop, and Notification entries whose command
-matches monet-claude-hook.sh.  Other hooks are preserved."
+Removes Stop, SubagentStop, Notification, and UserPromptSubmit entries
+whose command matches monet-claude-hook.py.  Other hooks are preserved."
   (interactive)
   (let* ((script-path (monet--claude-hook-script-path))
          (settings (monet--read-claude-settings)))
@@ -2219,7 +2245,7 @@ matches monet-claude-hook.sh.  Other hooks are preserved."
         (message "No ~/.claude/settings.json found; nothing to remove.")
       (let* ((hooks-cell (assq 'hooks settings))
              (hooks (and hooks-cell (cdr hooks-cell)))
-             (event-names '(Stop SubagentStop Notification)))
+             (event-names '(Stop SubagentStop Notification UserPromptSubmit)))
         (dolist (event event-names)
           (let ((event-cell (assq event hooks)))
             (when event-cell

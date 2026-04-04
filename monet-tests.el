@@ -562,21 +562,25 @@
     (should (null monet--claude-hook-functions))))
 
 (ert-deftest monet-test-claude-hook-receive-dispatches ()
-  "monet-claude-hook-receive calls each registered handler with event and data."
+  "monet-claude-hook-receive calls each handler with (event data ctx)."
   (monet-test-with-clean-hooks
     (let ((received nil))
       (monet-add-claude-hook-handler
-       (lambda (event data) (push (cons event data) received)))
+       (lambda (event data ctx) (push (list event data ctx) received)))
       (let ((tmpfile (make-temp-file "monet-hook-test-" nil ".json")))
         (unwind-protect
             (progn
               (with-temp-file tmpfile
-                (insert "{\"hook_event_name\": \"Stop\", \"cwd\": \"/tmp\"}"))
+                (insert (json-encode
+                         '((hook_payload . ((hook_event_name . "Stop") (cwd . "/tmp")))
+                           (monet_context . ((baton_session . "claude-1")))))))
               (monet-claude-hook-receive tmpfile)
               (should (= 1 (length received)))
-              (should (equal "Stop" (car (car received))))
-              (should (equal "/tmp"
-                             (cdr (assq 'cwd (cdr (car received)))))))
+              (let ((entry (car received)))
+                (should (equal "Stop" (nth 0 entry)))
+                (should (equal "/tmp" (cdr (assq 'cwd (nth 1 entry)))))
+                (should (equal "claude-1"
+                               (cdr (assq 'baton_session (nth 2 entry)))))))
           (ignore-errors (delete-file tmpfile)))))))
 
 (ert-deftest monet-test-claude-hook-receive-handler-error-isolated ()
@@ -585,14 +589,16 @@
     (let ((second-called nil))
       ;; Push in reverse order because monet-add-claude-hook-handler prepends
       (monet-add-claude-hook-handler
-       (lambda (_e _d) (setq second-called t)))
+       (lambda (_e _d _c) (setq second-called t)))
       (monet-add-claude-hook-handler
-       (lambda (_e _d) (error "intentional test error")))
+       (lambda (_e _d _c) (error "intentional test error")))
       (let ((tmpfile (make-temp-file "monet-hook-test-" nil ".json")))
         (unwind-protect
             (progn
               (with-temp-file tmpfile
-                (insert "{\"hook_event_name\": \"Stop\"}"))
+                (insert (json-encode
+                         '((hook_payload . ((hook_event_name . "Stop")))
+                           (monet_context . ())))))
               (monet-claude-hook-receive tmpfile)
               (should second-called))
           (ignore-errors (delete-file tmpfile)))))))
@@ -614,7 +620,7 @@
           (monet-install-claude-hooks)
           (let* ((settings (json-read-file (monet--claude-settings-path)))
                  (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification))
+            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
               (let* ((event-list (append (cdr (assq event hooks)) nil))
                      (commands (mapcar #'monet--hook-entry-command event-list)))
                 (should (member script-path commands)))))
@@ -622,7 +628,7 @@
           (monet-remove-claude-hooks)
           (let* ((settings (json-read-file (monet--claude-settings-path)))
                  (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification))
+            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
               (let* ((event-list (append (cdr (assq event hooks)) nil))
                      (commands (mapcar #'monet--hook-entry-command event-list)))
                 (should-not (member script-path commands))))))
@@ -639,7 +645,7 @@
           (monet-install-claude-hooks)
           (let* ((settings (json-read-file (monet--claude-settings-path)))
                  (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification))
+            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
               (let* ((event-list (append (cdr (assq event hooks)) nil))
                      (commands (mapcar #'monet--hook-entry-command event-list)))
                 (should (= 1 (cl-count script-path commands :test #'equal)))))))
