@@ -28,9 +28,10 @@ with tempfile.NamedTemporaryFile(
     suffix=".json", prefix="monet-hook-", delete_on_close=False, mode="w"
 ) as f:
     json.dump(envelope, f)
-    tmpfile = f.name
+    f.close()  # close the file, I'm done with writing to it for now
 
-try:
+    # stay in the context manager to get the free deletion on completion/exception
+    tmpfile = f.name
     escaped = tmpfile.replace("\\", "\\\\").replace('"', '\\"')
     cmd: list[str] = [
         "emacsclient",
@@ -45,5 +46,3 @@ try:
             file=sys.stderr,
         )
         sys.exit(result.returncode)
-finally:
-    os.unlink(tmpfile)
