@@ -132,6 +132,10 @@ iff the tool's set is in this list.")
 
 ;;; Public Session API
 
+(defun monet-session-key (session)
+  "Return the key (caller-supplied identifier) of monet SESSION."
+  (monet--session-key session))
+
 (defun monet-session-directory (session)
   "Return the working directory of monet SESSION."
   (monet--session-directory session))
