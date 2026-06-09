@@ -154,11 +154,23 @@ emacs --batch -L . -l test-diff-visibility.el
 
 11. **Tab-bar integration**: Session tracks `originating-tab` for do-not-disturb mode. The code checks `tab-bar-mode` and `tab-bar--current-tab` (internal Emacs API).
 
-12. **Claude Code lifecycle hooks use a Python script** (`monet-claude-hook.py`).  It
-    wraps the raw JSON payload and `MONET_CTX_*` env vars into a
-    `{"hook_payload": ..., "monet_context": ...}` envelope and delivers it to
-    `monet-claude-hook-receive` via `emacsclient`.  Handlers receive three args:
-    `(event-name data ctx)`.  See [hooks.md](hooks.md) for full details.
+12. **Claude Code lifecycle hooks use a Python script + HTTP transport**
+    (`monet-claude-hook.py`).  It wraps the raw JSON payload and `MONET_CTX_*` env
+    vars into a `{"hook_payload": ..., "monet_context": ...}` envelope and POSTs it to
+    `http://127.0.0.1:$MONET_HOOK_PORT/hook` with header
+    `Authorization: Bearer $MONET_HOOK_TOKEN`.  Emacs runs a single shared HTTP hook
+    server (a raw `make-network-process`, state in `monet--hook-server` /
+    `monet--hook-port` / `monet--hook-token`) that validates the token and calls
+    `monet--hook-dispatch-envelope`, which invokes each handler with three args:
+    `(event-name data ctx)`.  The server is started once when `monet-mode` is enabled
+    (and stopped on disable); there is no `emacsclient`, no temp file, and no
+    `MONET_EMACS_SOCKET`.  See [hooks.md](hooks.md) for full details.
+
+    `monet-start-server-function` returns a plist
+    `(:env ENV-STRINGS :ports PORT-LIST)` — `:env` carries the env var assignments the
+    Claude process needs (including `MONET_HOOK_PORT` / `MONET_HOOK_TOKEN`) and `:ports`
+    lists the host ports it must reach (MCP port + hook port). This replaces the old
+    bare-list return value.
 
 13. **Hook handler signature is 3-arg** `(event-name data ctx)` — not 2-arg.  Any
     handler registered via `monet-add-claude-hook-handler` must accept all three.
