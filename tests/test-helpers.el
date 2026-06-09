@@ -15,5 +15,16 @@
   `(let ((monet--claude-hook-functions nil))
      ,@body))
 
+(defmacro monet-test-with-hook-server (&rest body)
+  "Execute BODY with a fresh, isolated HTTP hook server.
+Starts the server before BODY and stops it with cleanup after."
+  (declare (indent 0))
+  `(let ((monet--hook-server nil)
+         (monet--hook-port nil))
+     (monet--start-hook-server)
+     (unwind-protect
+         (progn ,@body)
+       (monet--stop-hook-server))))
+
 (provide 'test-helpers)
 ;;; tests/test-helpers.el ends here

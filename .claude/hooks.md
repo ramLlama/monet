@@ -1,11 +1,13 @@
+<!-- Last updated: hook transport migrated from emacsclient/temp-file to HTTP POST -->
+
 # Claude Code Lifecycle Hooks
 
 ## Overview
 
 Monet installs a Python script (`monet-claude-hook.py`) as a Claude Code lifecycle hook.
 When Claude Code fires a lifecycle event, it invokes the script with a JSON payload on
-stdin.  The script delivers the event to Emacs via `emacsclient`, where registered
-Elisp handlers dispatch on the event name.
+stdin.  The script delivers the event to Emacs by POSTing it to a local HTTP server that
+Monet runs, where registered Elisp handlers dispatch on the event name.
 
 ## Hook Pipeline
 
@@ -14,18 +16,69 @@ Claude Code
   → spawns monet-claude-hook.py (JSON on stdin)
      → reads payload from stdin
      → collects MONET_CTX_* env vars into ctx dict
-     → writes {"hook_payload": payload, "monet_context": ctx} to temp file
-     → calls emacsclient -e '(monet-claude-hook-receive "/tmp/monet-hook-*.json")'
-     → deletes temp file (finally block)
-  → Emacs: monet-claude-hook-receive
-     → parses envelope
-     → calls monet--log-hook (if logging enabled)
-     → dispatches each handler with (event-name data ctx)
+     → builds envelope {"hook_payload": payload, "monet_context": ctx}
+     → POSTs envelope to http://127.0.0.1:$MONET_HOOK_PORT/hook
+        with header  Authorization: Bearer $MONET_HOOK_TOKEN
+  → Emacs HTTP hook server (monet--hook-server)
+     → monet--hook-connection-filter accumulates the request, validates the token
+     → monet--hook-dispatch-envelope (parses envelope)
+        → calls monet--log-hook (if logging enabled)
+        → dispatches each handler with (event-name data ctx)
+     → returns 200 OK (401 on bad token, 400 on unparseable body)
 ```
+
+The Python script requires both `MONET_HOOK_PORT` and `MONET_HOOK_TOKEN` to be set in
+its environment; it exits non-zero with a diagnostic on stderr if either is missing, if
+stdin is not valid JSON, or if the HTTP request fails / returns non-200.
+
+## HTTP Hook Server
+
+A single shared HTTP server handles hook delivery for *all* sessions.  It is a raw
+`make-network-process` server (not a full HTTP library) that parses just enough of the
+request to read the `Content-Length`, `Authorization` header, and body.
+
+State (module-level vars in `monet.el`):
+
+| Var                  | Meaning                                              |
+|----------------------|------------------------------------------------------|
+| `monet--hook-server` | The server network process, or nil when not running. |
+| `monet--hook-port`   | Port the server listens on (loopback only).          |
+| `monet--hook-token`  | Bearer token clients must present (a generated UUID). |
+
+Lifecycle:
+
+- `monet--start-hook-server` — idempotent; if no server is running, picks a free port and
+  a fresh UUID token, then starts a loopback (`:host 'local`, IPv4) server. Returns the
+  port. Called once when `monet-mode` is enabled, and again (as a no-op safety call) from
+  `monet-start-server-function`.
+- `monet--stop-hook-server` — deletes the server process and clears all three vars. Called
+  when `monet-mode` is disabled.
+
+The server binds loopback-only and authenticates every request against
+`monet--hook-token`, so the token is the sole authorization boundary.
+
+## monet-start-server-function returns a plist
+
+`monet-start-server-function` returns:
+
+```elisp
+(:env ("ENABLE_IDE_INTEGRATION=t"
+       "CLAUDE_CODE_SSE_PORT=<mcp-port>"
+       "MONET_HOOK_PORT=<hook-port>"
+       "MONET_HOOK_TOKEN=<token>")
+ :ports (<mcp-port> <hook-port>))
+```
+
+- `:env` — environment variable assignments the spawned Claude process needs. This is how
+  `MONET_HOOK_PORT` / `MONET_HOOK_TOKEN` reach `monet-claude-hook.py`.
+- `:ports` — the host ports the Claude process must be able to reach (MCP port + hook
+  port). Useful for sandboxing / firewalling callers that need to allow-list ports.
+
+This is a change from the previous bare-list return value.
 
 ## Envelope Format
 
-The temp file written by the Python script contains:
+The JSON body POSTed by the Python script is:
 
 ```json
 {
@@ -111,9 +164,3 @@ Each hook event produces one log line:
 M-x monet-install-claude-hooks  ; idempotent; adds entries to ~/.claude/settings.json
 M-x monet-remove-claude-hooks   ; removes only monet's entries; other hooks preserved
 ```
-
-## MONET_EMACS_SOCKET
-
-If `MONET_EMACS_SOCKET` is set in the environment at Claude Code spawn time, the Python
-script passes `-s <socket>` to `emacsclient`, routing events to the correct Emacs
-instance.  `monet-start-server-function` injects this automatically.

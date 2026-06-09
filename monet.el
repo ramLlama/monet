@@ -577,14 +577,17 @@ Returns the session object."
 (defun monet-start-server-function (key directory)
   "Start a Monet server with KEY in DIRECTORY.
 
-Returns the process environment variables needed to start a Claude
-process that will connect to the Claude server as a list."
-  (let* ((session (monet-start-server-in-directory key default-directory))
-         (port (monet--session-port session)))
-    `("ENABLE_IDE_INTEGRATION=t"
-      ,(format "CLAUDE_CODE_SSE_PORT=%d" port)
-      ,(format "MONET_EMACS_SOCKET=%s"
-               (expand-file-name server-name server-socket-dir)))))
+Returns a plist (:env ENV-STRINGS :ports PORT-LIST) where ENV-STRINGS
+is the list of environment variable assignments needed by the Claude
+process and PORT-LIST lists the host ports it must be able to reach."
+  (monet--start-hook-server)
+  (let* ((session (monet-start-server-in-directory key directory))
+         (mcp-port (monet--session-port session))
+         (hook-port monet--hook-port))
+    `(:env ("ENABLE_IDE_INTEGRATION=t"
+            ,(format "CLAUDE_CODE_SSE_PORT=%d" mcp-port)
+            ,(format "MONET_HOOK_PORT=%d" hook-port))
+      :ports (,mcp-port ,hook-port))))
 
 ;;; MCP Protocol Handlers
 ;;;; Initialization handlers
@@ -2137,25 +2140,95 @@ payload from the hook, and CTX is an alist of MONET_CTX_* environment
 variables injected at Claude Code spawn time (keys lowercased, prefix
 stripped).")
 
+(defvar monet--hook-server nil "The HTTP hook server network process.")
+(defvar monet--hook-port nil "Port the HTTP hook server is listening on.")
+
+(defun monet--hook-dispatch-envelope (envelope)
+  "Dispatch a parsed hook ENVELOPE to all registered handlers.
+ENVELOPE is an alist with hook_payload and monet_context keys.
+Calls each handler in `monet--claude-hook-functions' with (EVENT-NAME DATA CTX)."
+  (let* ((data       (cdr (assq 'hook_payload  envelope)))
+         (ctx        (cdr (assq 'monet_context envelope)))
+         (event-name (cdr (assq 'hook_event_name data))))
+    (monet--log-hook event-name data ctx)
+    (dolist (handler monet--claude-hook-functions)
+      (condition-case err
+          (funcall handler event-name data ctx)
+        (error
+         (message "monet hook handler %s error: %s"
+                  handler (error-message-string err)))))))
+
 (defun monet-claude-hook-receive (json-file)
   "Receive a Claude Code lifecycle event from JSON-FILE.
 JSON-FILE contains {\"hook_payload\": {...}, \"monet_context\": {...}}.
-Called by the monet-claude-hook.py script via emacsclient.
-Reads JSON-FILE, extracts hook_event_name, and calls each function in
-`monet--claude-hook-functions' with (EVENT-NAME DATA CTX).
-Per-handler errors are caught so a failing handler does not block others."
+Reads the file and dispatches the envelope to all registered handlers."
   (when (file-readable-p json-file)
-    (let* ((envelope   (json-read-file json-file))
-           (data       (cdr (assq 'hook_payload  envelope)))
-           (ctx        (cdr (assq 'monet_context envelope)))
-           (event-name (cdr (assq 'hook_event_name data))))
-      (monet--log-hook event-name data ctx)
-      (dolist (handler monet--claude-hook-functions)
-        (condition-case err
-            (funcall handler event-name data ctx)
-          (error
-           (message "monet-claude-hook-receive: handler %s error: %s"
-                    handler (error-message-string err))))))))
+    (monet--hook-dispatch-envelope (json-read-file json-file))))
+
+;;; HTTP hook server
+
+(defun monet--hook-parse-content-length (headers-str)
+  "Return the Content-Length value from HEADERS-STR, or nil if absent."
+  (when (string-match "^[Cc]ontent-[Ll]ength: *\\([0-9]+\\)" headers-str)
+    (string-to-number (match-string 1 headers-str))))
+
+(defun monet--hook-send-response (proc status-code status-text)
+  "Send an HTTP response with STATUS-CODE and STATUS-TEXT to PROC."
+  (process-send-string
+   proc
+   (format "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+           status-code status-text)))
+
+(defun monet--hook-connection-filter (proc data)
+  "Accumulate DATA from hook connection PROC; dispatch when request is complete."
+  ;; Keep the buffer unibyte (no-conversion mode) so length/substring are
+  ;; byte-accurate and match the HTTP Content-Length byte count.
+  (let ((buf (let ((prev (process-get proc :buf)))
+               (if prev (concat prev data) (copy-sequence data)))))
+    (process-put proc :buf buf)
+    (when-let* ((hdr-end (string-search "\r\n\r\n" buf))
+                (headers-str (substring buf 0 hdr-end))
+                (body-start (+ hdr-end 4))
+                (content-length (monet--hook-parse-content-length headers-str)))
+      (when (>= (- (length buf) body-start) content-length)
+        ;; Full request received — clear buffer and process
+        (process-put proc :buf nil)
+        (let* ((raw-body (substring buf body-start (+ body-start content-length)))
+               (body (decode-coding-string raw-body 'utf-8)))
+          (condition-case err
+              (progn
+                (monet--hook-dispatch-envelope (json-read-from-string body))
+                (monet--hook-send-response proc 200 "OK"))
+            (error
+             (message "monet hook: failed to parse request body: %s"
+                      (error-message-string err))
+             (monet--hook-send-response proc 400 "Bad Request"))))
+        (delete-process proc)))))
+
+(defun monet--start-hook-server ()
+  "Start the shared HTTP hook server if not already running.
+Sets `monet--hook-server' and `monet--hook-port'."
+  (unless monet--hook-server
+    (let ((port (monet--find-free-port)))
+      (setq monet--hook-port port
+            monet--hook-server
+            (make-network-process
+             :name "monet-hook-server"
+             :server t
+             :host 'local
+             :service port
+             :family 'ipv4
+             :filter #'monet--hook-connection-filter
+             :coding 'no-conversion
+             :noquery t))))
+  monet--hook-port)
+
+(defun monet--stop-hook-server ()
+  "Stop the HTTP hook server and clear its state."
+  (when monet--hook-server
+    (delete-process monet--hook-server)
+    (setq monet--hook-server nil
+          monet--hook-port nil)))
 
 (defun monet-add-claude-hook-handler (handler)
   "Register HANDLER as a Claude Code lifecycle event handler.
@@ -2427,10 +2500,14 @@ When enabled, provides key bindings for managing Monet sessions.
       (progn
         ;; Initialize tool registry with all built-in tools
         (monet-register-core-tools)
+        ;; Start the shared HTTP hook server
+        (monet--start-hook-server)
         ;; Update keymap in case prefix key changed
         (setq monet-mode-map (monet--make-mode-map))
         (message "Monet mode enabled. Use %s for commands."
                  (or monet-prefix-key "M-x monet-")))
+    ;; Stop the HTTP hook server on disable
+    (monet--stop-hook-server)
     (message "Monet mode disabled.")))
 
 ;;; provide monet
