@@ -15,3 +15,7 @@ monet-autoloads.el
 
 # Experimental sockets/MCP directory
 sockets-mcp/
+
+# claude extras
+.claude/progress.md
+.claude/agent-memory
