@@ -27,11 +27,12 @@ monet.el WebSocket Server (one per session, localhost:<random-port>)
    - Generate UUID auth token
    - Create `monet--session` struct
    - Start WebSocket server with `websocket-server`
-   - Write lockfile to `~/.claude/ide/<port>.lock`
+   - Write lockfile to `~/.claude/ide/<port>.lock` (`pid` is the literal `1`; `workspaceFolders` lists the host folder plus the guest path when path mappings apply)
    - Register `post-command-hook` for selection tracking
 
 2. **Client connection** (`monet--on-open-server`):
    - Store client WebSocket reference in session
+   - Message client-connected to `*Messages*` (observable)
 
 3. **Handshake**:
    - Claude sends `initialize` request
@@ -49,13 +50,14 @@ monet.el WebSocket Server (one per session, localhost:<random-port>)
    - Diff operations use deferred response pattern
 
 6. **Shutdown** (`monet--on-close-server`):
+   - Message client-disconnected to `*Messages*` (the session/lockfile removal is now observable)
    - Remove lockfile
    - Remove session from hash table
    - Clean up hooks if last session
 
 ## Message Routing
 
-`monet--on-message` dispatches based on the `method` field:
+`monet--on-message` first translates inbound `params` to host paths (see [Guest/Host Path Mapping](#guesthost-path-mapping)), then dispatches based on the `method` field:
 
 | Method | Handler | Notes |
 |--------|---------|-------|
@@ -109,6 +111,29 @@ When `monet-hide-diff-when-irrelevant` is enabled:
 - For each active diff, checks if current buffer is "relevant" (same session directory or initiating file)
 - Shows/hides diff windows by switching them to/from previous buffers
 
+## Guest/Host Path Mapping
+
+When Claude runs inside a sandbox (microVM guest), it sees the workspace at a guest path (e.g. `/workspace`) while Emacs/monet operate on the host path. A session may carry `path-mappings` -- an alist of `(HOST-PREFIX . GUEST-PREFIX)`. Path-bearing protocol fields are translated at the WebSocket boundary so every handler runs in host terms while Claude always sees guest terms.
+
+Translation choke points (host is canonical internally):
+
+| Direction | Where | What |
+|-----------|-------|------|
+| inbound → host | `monet--on-message` | the full `params` alist, once, before dispatch |
+| outbound → guest | `monet--send-response` | the `result` payload |
+| outbound → guest | `monet--send-notification` | the `params` payload |
+
+Outbound functions recover the session via `monet--find-session-by-client` (they receive a websocket, not a session).
+
+Translation is **key-driven**, not value-sniffing:
+- `monet--path-keys` (`uri`, `old_file_path`, `new_file_path`, `filePath`, `path`) -- alist keys whose string value is a single path.
+- `monet--path-list-keys` (`workspaceFolders`) -- alist keys whose value is a sequence of paths.
+- `monet--translate-walk` deep-copies the payload, rewriting only values under those keys. Content fields (e.g. `new_file_contents`) are never touched even when they embed path-like text.
+- `monet--translate-path` does the prefix rewrite: longest-prefix-first, matching only at path-segment boundaries (so `/ws/feat` does not match `/ws/feat-other`), and `file://`-aware (rewrites only the path part of a `file://` URI).
+- `monet--translate-paths` is the entry point; it returns the payload **unchanged (eq, no copy)** when the session has no mappings, so non-sandboxed sessions pay nothing.
+
+The lockfile also advertises the guest view of the session folder as an extra `workspaceFolders` entry (see [Connection Lifecycle](#connection-lifecycle)), so a sandboxed Claude matches the lockfile against its in-guest cwd.
+
 ## Selection Tracking
 
 - `monet--track-selection-change` runs on every `post-command-hook`
@@ -130,6 +155,7 @@ When `monet-hide-diff-when-irrelevant` is enabled:
 - `opened-diffs`: Hash table of `tab-name -> diff-context` alist
 - `deferred-responses`: Hash table of `unique-key -> request-id`
 - `originating-buffer/tab/frame`: Context for do-not-disturb mode
+- `path-mappings`: Alist of `(HOST-PREFIX . GUEST-PREFIX)` for sandbox path translation; nil for non-sandboxed sessions
 
 ### `monet--sessions` (hash table)
 Global registry: `session-key -> monet--session`
