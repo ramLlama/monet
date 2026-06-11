@@ -17,10 +17,17 @@ Monet is an Emacs package that implements the (undocumented) Claude Code IDE pro
 
 ```
 monet/
-  monet.el                      # Core implementation (~2435 lines)
+  monet.el                      # Core implementation
   monet-emacs-tools.el          # Opt-in introspection tools (xref, imenu, treesit)
-  monet-tests.el                # ERT test suite (43 tests)
   monet-claude-hook.py          # Claude Code lifecycle hook script (replaces .sh)
+  tests/                        # ERT test suite (split by area; see Makefile TEST_FILES)
+    test-helpers.el             #   shared macros (monet-test-with-clean-registry, ...)
+    test-registry.el           #   tool registry API
+    test-dispatch.el           #   MCP dispatch
+    test-emacs-tools.el        #   introspection tool formatting
+    test-hooks.el              #   Claude Code lifecycle hooks
+    test-lockfile.el           #   lockfile workspaceFolders + start-server env shape
+    test-path-mapping.el       #   guest/host path translation (end-to-end)
   Makefile                      # Build: checkdoc + byte-compile + test + pre-commit
   README.md                     # User-facing documentation
   CHANGELOG.md                  # Version history (currently at 0.0.3)
@@ -39,6 +46,7 @@ Each Claude Code connection is a **session**, stored in `monet--sessions` hash t
 - Opened diffs (hash table keyed by `tab-name`)
 - Deferred responses (for async diff accept/reject flows)
 - Originating buffer/tab/frame context
+- `path-mappings` -- alist of `(HOST-PREFIX . GUEST-PREFIX)` when Claude runs in a sandbox seeing the workspace at a different path; nil for non-sandboxed sessions (see [Sandbox Path Mapping](#sandbox-path-mapping))
 
 ### Tool Registry
 Tools are managed via a dynamic registry (`monet--tool-registry`), an alist of `(name . spec-plist)`. Each spec has `:description`, `:schema`, `:handler`, `:set`, and `:enabled`.
@@ -86,6 +94,9 @@ The active strategy is selected by which handler is registered for `openDiff` vi
 ### Deferred Responses
 The `openDiff` tool uses a deferred response pattern: the MCP request is not immediately answered. Instead, the response ID is stored, and the actual response is sent when the user accepts or rejects the diff.
 
+### Sandbox Path Mapping
+Monet's Claude Code IDE integration works across a sandbox boundary -- Claude running in a microVM guest (seeing the workspace at e.g. `/workspace`) while Emacs/monet run on the host (seeing it at the host path). When a session carries `path-mappings`, monet translates path-bearing protocol fields at the WebSocket boundary: inbound params become host paths (once, in `monet--on-message`), outbound responses/notifications become guest paths (`monet--send-response`, `monet--send-notification`). Translation is key-driven, `file://`-aware, and never touches content fields. See [architecture.md](architecture.md#guesthost-path-mapping) for the full subsystem.
+
 ## Architecture Overview
 
 See [architecture.md](architecture.md) for details.
@@ -110,11 +121,11 @@ make clean        # Remove .elc files
 
 ### Testing
 ```bash
-make test         # Run ERT test suite (monet-tests.el, 43 tests)
+make test         # Run ERT test suite (tests/*.el, 65 tests)
 make pre-commit   # checkdoc + test (also run by the git pre-commit hook)
 ```
 
-The ERT suite in `monet-tests.el` covers the tool registry API, dispatch, enable/disable semantics, ownership transfer, and introspection tool formatting. Tests use the `monet-test-with-clean-registry` macro to isolate the global registry.
+The ERT suite lives under `tests/` (loaded via the `TEST_FILES` variable in the Makefile) and covers the tool registry API, dispatch, enable/disable semantics, ownership transfer, introspection tool formatting, Claude Code hooks, lockfile contents / start-server env shape, and guest/host path mapping. Tests use the `monet-test-with-clean-registry` macro (in `tests/test-helpers.el`) to isolate the global registry.
 
 `test-diff-visibility.el` is a separate manual integration test for diff visibility logic:
 ```bash
@@ -132,7 +143,7 @@ emacs --batch -L . -l test-diff-visibility.el
 
 ## Critical Idiosyncrasies & Gotchas
 
-1. **Multi-file package**: Core in `monet.el` (~2160 lines); opt-in introspection tools in `monet-emacs-tools.el`; ERT tests in `monet-tests.el`.
+1. **Multi-file package**: Core in `monet.el`; opt-in introspection tools in `monet-emacs-tools.el`; ERT tests split by area under `tests/` (loaded via the Makefile `TEST_FILES` variable).
 
 2. **Version mismatch**: `monet-version` constant is `"0.0.1"` but `Package-Requires` header says `Version: 0.0.3`. These are out of sync.
 
@@ -147,6 +158,9 @@ emacs --batch -L . -l test-diff-visibility.el
 7. **Polymorphic diff cleanup**: `monet--cleanup-diff` calls the `cleanup-fn` stored in the diff context alist. Both `monet-simple-diff-tool` and `monet-ediff-tool` set this. Custom `openDiff` handlers must include `cleanup-fn` in their returned context or cleanup will silently fall back to `monet-simple-diff-cleanup-tool`.
 
 8. **Lockfile protocol**: Lockfiles at `~/.claude/ide/<port>.lock` contain JSON with `pid`, `workspaceFolders`, `ideName`, `transport`, and `authToken`. Claude Code discovers these to connect. Windows uses `USERPROFILE` instead of `~`.
+
+    - **`pid` is the literal `1`, not `(emacs-pid)`**: Claude reaps lockfiles whose pid is dead, and the Emacs pid does not exist inside a sandbox guest's pid namespace; pid 1 exists everywhere. Monet manages its own lockfile lifecycle (removed on session close), so Claude-side pid reaping is not load-bearing.
+    - **`monet--create-lockfile` takes an optional `EXTRA-FOLDERS`**: appended to `workspaceFolders` after the session folder. `monet-start-server-in-directory` passes the guest-side path of the worktree (derived from `path-mappings`) so a sandboxed Claude whose cwd is the guest path still matches the lockfile.
 
 9. **Selection tracking runs on `post-command-hook`**: Every keystroke triggers selection tracking logic (debounced at 50ms). This must remain lightweight.
 
@@ -166,11 +180,23 @@ emacs --batch -L . -l test-diff-visibility.el
     (and stopped on disable); there is no `emacsclient`, no temp file, and no
     `MONET_EMACS_SOCKET`.  See [hooks.md](hooks.md) for full details.
 
+    The hook command registered in `settings.json` is the $HOME-relative
+    `monet--claude-hook-command` (`"$HOME/.claude/hooks/monet-claude-hook.py"`).
+    `monet-install-claude-hooks` copies `monet-claude-hook.py` into `~/.claude/hooks/`
+    (mode `0755`) and registers that command. Hook commands run through `/bin/sh`, which
+    expands `$HOME` — so one `settings.json` works on host and inside sandbox guests whose
+    home differs (given `~/.claude` is shared/mounted). Install is idempotent by
+    prune-then-append; the remover matches the exact command. There is no legacy-path
+    migration (deliberate).
+
     `monet-start-server-function` returns a plist
     `(:env ENV-STRINGS :ports PORT-LIST)` — `:env` carries the env var assignments the
     Claude process needs (including `MONET_HOOK_PORT` / `MONET_HOOK_TOKEN`) and `:ports`
     lists the host ports it must reach (MCP port + hook port). This replaces the old
-    bare-list return value.
+    bare-list return value. `:env` includes `ENABLE_IDE_INTEGRATION=true` — Claude Code
+    only recognizes the string `"true"`, not other truthy spellings. The function (and
+    `monet-start-server-in-directory`) take an optional `PATH-MAPPINGS` arg threaded into
+    the session for sandbox path translation.
 
 13. **Hook handler signature is 3-arg** `(event-name data ctx)` — not 2-arg.  Any
     handler registered via `monet-add-claude-hook-handler` must accept all three.

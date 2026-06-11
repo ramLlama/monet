@@ -178,47 +178,78 @@ Returns the HTTP status code, or nil on connection failure."
 
 ;;; Hook settings install/remove
 
+(defmacro monet-test-with-settings-sandbox (&rest body)
+  "Run BODY with settings.json and the hooks dir redirected to a temp dir.
+The temp directory is bound to `tmpdir' within BODY."
+  (declare (indent 0))
+  `(let ((tmpdir (make-temp-file "monet-settings-test-" t)))
+     (ignore tmpdir)
+     (unwind-protect
+         (cl-letf (((symbol-function 'monet--claude-settings-path)
+                    (lambda () (expand-file-name "settings.json" tmpdir)))
+                   ((symbol-function 'monet--claude-hooks-dir)
+                    (lambda () (expand-file-name "hooks/" tmpdir))))
+           ,@body)
+       (ignore-errors (delete-directory tmpdir t)))))
+
 (ert-deftest monet-test-install-remove-claude-hooks ()
-  "monet-install-claude-hooks writes entries; monet-remove-claude-hooks removes them."
-  (let ((tmpdir (make-temp-file "monet-settings-test-" t))
-        (script-path (monet--claude-hook-script-path)))
-    (unwind-protect
-        (cl-letf (((symbol-function 'monet--claude-settings-path)
-                   (lambda () (expand-file-name "settings.json" tmpdir))))
-          ;; Install
-          (monet-install-claude-hooks)
-          (let* ((settings (json-read-file (monet--claude-settings-path)))
-                 (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
-              (let* ((event-list (append (cdr (assq event hooks)) nil))
-                     (commands (mapcar #'monet--hook-entry-command event-list)))
-                (should (member script-path commands)))))
-          ;; Remove
-          (monet-remove-claude-hooks)
-          (let* ((settings (json-read-file (monet--claude-settings-path)))
-                 (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
-              (let* ((event-list (append (cdr (assq event hooks)) nil))
-                     (commands (mapcar #'monet--hook-entry-command event-list)))
-                (should-not (member script-path commands))))))
-      (ignore-errors (delete-directory tmpdir t)))))
+  "monet-install-claude-hooks writes entries; monet-remove-claude-hooks removes them.
+The registered command is $HOME-relative so it resolves on the host and
+inside sandbox guests alike (hook commands run through /bin/sh)."
+  (monet-test-with-settings-sandbox
+    ;; Install
+    (monet-install-claude-hooks)
+    (let* ((settings (json-read-file (monet--claude-settings-path)))
+           (hooks (cdr (assq 'hooks settings))))
+      (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
+        (let* ((event-list (append (cdr (assq event hooks)) nil))
+               (commands (mapcar #'monet--hook-entry-command event-list)))
+          (should (member monet--claude-hook-command commands)))))
+    ;; Remove
+    (monet-remove-claude-hooks)
+    (let* ((settings (json-read-file (monet--claude-settings-path)))
+           (hooks (cdr (assq 'hooks settings))))
+      (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
+        (let* ((event-list (append (cdr (assq event hooks)) nil))
+               (commands (mapcar #'monet--hook-entry-command event-list)))
+          (should-not (member monet--claude-hook-command commands)))))))
+
+(ert-deftest monet-test-install-claude-hooks-copies-script ()
+  "monet-install-claude-hooks copies an executable hook script into hooks dir.
+~/.claude is typically reachable inside sandbox guests (bind mount) while
+the monet repo is not, so the script must live under ~/.claude."
+  (monet-test-with-settings-sandbox
+    (monet-install-claude-hooks)
+    (let ((installed (expand-file-name "monet-claude-hook.py"
+                                       (monet--claude-hooks-dir))))
+      (should (file-exists-p installed))
+      (should (file-executable-p installed)))))
 
 (ert-deftest monet-test-install-claude-hooks-idempotent ()
   "monet-install-claude-hooks does not duplicate entries on repeated calls."
-  (let ((tmpdir (make-temp-file "monet-settings-test-" t))
-        (script-path (monet--claude-hook-script-path)))
-    (unwind-protect
-        (cl-letf (((symbol-function 'monet--claude-settings-path)
-                   (lambda () (expand-file-name "settings.json" tmpdir))))
-          (monet-install-claude-hooks)
-          (monet-install-claude-hooks)
-          (let* ((settings (json-read-file (monet--claude-settings-path)))
-                 (hooks (cdr (assq 'hooks settings))))
-            (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
-              (let* ((event-list (append (cdr (assq event hooks)) nil))
-                     (commands (mapcar #'monet--hook-entry-command event-list)))
-                (should (= 1 (cl-count script-path commands :test #'equal)))))))
-      (ignore-errors (delete-directory tmpdir t)))))
+  (monet-test-with-settings-sandbox
+    (monet-install-claude-hooks)
+    (monet-install-claude-hooks)
+    (let* ((settings (json-read-file (monet--claude-settings-path)))
+           (hooks (cdr (assq 'hooks settings))))
+      (dolist (event '(Stop SubagentStop Notification UserPromptSubmit))
+        (let* ((event-list (append (cdr (assq event hooks)) nil))
+               (commands (mapcar #'monet--hook-entry-command event-list)))
+          (should (= 1 (cl-count monet--claude-hook-command commands
+                                 :test #'equal))))))))
+
+(ert-deftest monet-test-install-claude-hooks-preserves-other-entries ()
+  "Install leaves non-monet hook entries untouched."
+  (monet-test-with-settings-sandbox
+    (monet--write-claude-settings
+     `((hooks . ((Stop . [,(monet--hook-entry "/usr/bin/other-hook.sh")])))))
+    (monet-install-claude-hooks)
+    (let* ((settings (json-read-file (monet--claude-settings-path)))
+           (hooks (cdr (assq 'hooks settings)))
+           (stop-list (append (cdr (assq 'Stop hooks)) nil))
+           (commands (mapcar #'monet--hook-entry-command stop-list)))
+      (should (member "/usr/bin/other-hook.sh" commands))
+      (should (member monet--claude-hook-command commands)))))
 
 (provide 'test-hooks)
 ;;; tests/test-hooks.el ends here

@@ -9,6 +9,15 @@ When Claude Code fires a lifecycle event, it invokes the script with a JSON payl
 stdin.  The script delivers the event to Emacs by POSTing it to a local HTTP server that
 Monet runs, where registered Elisp handlers dispatch on the event name.
 
+`monet-install-claude-hooks` copies `monet-claude-hook.py` into `~/.claude/hooks/` (mode
+`0755`) and registers it in `settings.json` under the $HOME-relative command
+`monet--claude-hook-command` (`"$HOME/.claude/hooks/monet-claude-hook.py"`).  The command
+is deliberately `$HOME`-relative: Claude runs hook commands through `/bin/sh`, which
+expands `$HOME`, so the same `settings.json` works on the host and inside a sandbox guest
+whose home differs (given `~/.claude` is shared/mounted).  Install is idempotent by
+prune-then-append; the remover matches the exact command.  There is no migration of any
+legacy hook-command path (deliberate).
+
 ## Hook Pipeline
 
 ```
@@ -62,7 +71,7 @@ The server binds loopback-only and authenticates every request against
 `monet-start-server-function` returns:
 
 ```elisp
-(:env ("ENABLE_IDE_INTEGRATION=t"
+(:env ("ENABLE_IDE_INTEGRATION=true"
        "CLAUDE_CODE_SSE_PORT=<mcp-port>"
        "MONET_HOOK_PORT=<hook-port>"
        "MONET_HOOK_TOKEN=<token>")
@@ -71,10 +80,18 @@ The server binds loopback-only and authenticates every request against
 
 - `:env` — environment variable assignments the spawned Claude process needs. This is how
   `MONET_HOOK_PORT` / `MONET_HOOK_TOKEN` reach `monet-claude-hook.py`.
+  `ENABLE_IDE_INTEGRATION` must be the string `"true"` — Claude Code does not recognize
+  other truthy spellings (it was previously the Elisp `t`, i.e. `"t"`, which Claude
+  ignored).
 - `:ports` — the host ports the Claude process must be able to reach (MCP port + hook
   port). Useful for sandboxing / firewalling callers that need to allow-list ports.
 
 This is a change from the previous bare-list return value.
+
+`monet-start-server-function` (and `monet-start-server-in-directory`) also take an
+optional `PATH-MAPPINGS` arg — an alist of `(HOST-PREFIX . GUEST-PREFIX)` threaded into
+the session for sandbox path translation. See
+[architecture.md](architecture.md#guesthost-path-mapping).
 
 ## Envelope Format
 

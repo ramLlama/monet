@@ -23,7 +23,7 @@ compile: clean
 		-f batch-byte-compile $(EL_FILES) 2>&1 | grep -v "websocket" || true
 
 TEST_FILES := tests/test-helpers.el tests/test-registry.el tests/test-dispatch.el \
-              tests/test-emacs-tools.el tests/test-hooks.el
+              tests/test-emacs-tools.el tests/test-hooks.el tests/test-lockfile.el tests/test-path-mapping.el
 
 test:
 	$(EMACS) --batch -L . -L tests --eval "(package-initialize)" -l ert -l monet.el -l monet-emacs-tools.el \

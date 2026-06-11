@@ -128,6 +128,7 @@ iff the tool's set is in this list.")
   originating-buffer                    ; Buffer where session was started (for claude-code.el integration)
   originating-tab                       ; Tab name where session was started (if tab-bar-mode is active)
   originating-frame                     ; Frame where session was started
+  path-mappings                         ; Alist of (HOST-PREFIX . GUEST-PREFIX) when claude runs in a sandbox
   )
 
 ;;; Public Session API
@@ -211,14 +212,25 @@ iff the tool's set is in this list.")
           (error
            (error "Error removing lockfile %s: %s" file (error-message-string err))))))))
 
-(defun monet--create-lockfile (folder port auth-token session-key)
-  "Create lock file for claude running in FOLDER for PORT with AUTH-TOKEN and SESSION-KEY."
+(defun monet--create-lockfile (folder port auth-token session-key
+                                      &optional extra-folders)
+  "Create the IDE lock file advertising the server on PORT.
+FOLDER is the workspace folder claude runs in; AUTH-TOKEN and
+SESSION-KEY identify the session.  EXTRA-FOLDERS are additional
+workspaceFolders entries appended after FOLDER — e.g. the guest-side
+path of a sandboxed worktree, so a Claude whose cwd is the guest path
+still matches this lockfile."
   (condition-case err
       (let* ((dir (monet--get-lockfile-dir))
              (file (expand-file-name (format "%d.lock" port) dir))
+             ;; pid 1 rather than (emacs-pid): Claude reaps lockfiles whose
+             ;; pid is dead, and the Emacs pid does not exist inside sandbox
+             ;; guests' pid namespaces (pid 1 exists everywhere).  Monet
+             ;; manages its own lockfile lifecycle, so Claude-side pid
+             ;; reaping is not load-bearing.
              (content (json-encode
-                       `((pid . ,(emacs-pid))
-                         (workspaceFolders . ,(vector folder))
+                       `((pid . 1)
+                         (workspaceFolders . ,(apply #'vector folder extra-folders))
                          (ideName . ,(format "Emacs (%s @ %d)" session-key port))
                          (transport . "ws")
                          (authToken . ,auth-token)))))
@@ -396,13 +408,95 @@ Searches all sessions for the deferred response."
   "Get the Monet session for KEY, or nil if not found."
   (gethash key monet--sessions))
 
+;;; Guest/Host Path Mapping
+;;
+;; When claude runs inside a sandbox, it sees the workspace at a guest
+;; path (e.g. /workspace) while Emacs works on the host path.  A session
+;; may carry path-mappings — an alist of (HOST-PREFIX . GUEST-PREFIX) —
+;; and the protocol boundary translates path-bearing fields in both
+;; directions: inbound params to host paths (`monet--on-message'),
+;; outbound responses/notifications to guest paths (`monet--send-response',
+;; `monet--send-notification').  Only values under known path-bearing keys
+;; are rewritten; content fields are never touched.
+
+(defconst monet--path-keys
+  '(uri old_file_path new_file_path filePath path)
+  "Alist keys whose string values carry file paths in the MCP protocol.")
+
+(defconst monet--path-list-keys '(workspaceFolders)
+  "Alist keys whose values are sequences of path strings.")
+
+(defun monet--translate-path (mappings direction path)
+  "Rewrite PATH across MAPPINGS in DIRECTION; identity when nothing matches.
+MAPPINGS is an alist of (HOST-PREFIX . GUEST-PREFIX); DIRECTION is
+`to-host' or `to-guest'.  Prefixes match only at path-segment
+boundaries, longest prefix first.  file:// URIs are translated on
+their path part."
+  (if (string-prefix-p "file://" path)
+      (concat "file://"
+              (monet--translate-path mappings direction
+                                     (substring path (length "file://"))))
+    (let ((best nil) (best-len -1))
+      (dolist (mapping mappings)
+        (let ((from (if (eq direction 'to-guest) (car mapping) (cdr mapping)))
+              (to   (if (eq direction 'to-guest) (cdr mapping) (car mapping))))
+          (when (and (> (length from) best-len)
+                     (or (equal path from)
+                         (string-prefix-p (concat from "/") path)))
+            (setq best (cons from to)
+                  best-len (length from)))))
+      (if best
+          (concat (cdr best) (substring path (length (car best))))
+        path))))
+
+(defun monet--translate-walk (mappings direction object)
+  "Deep-copy OBJECT, translating path-bearing values across MAPPINGS.
+DIRECTION is `to-host' or `to-guest'; see `monet--translate-path'."
+  (cond
+   ;; Alist entry with a path-bearing key
+   ((and (consp object)
+         (memq (car-safe object) monet--path-keys)
+         (stringp (cdr object)))
+    (cons (car object)
+          (monet--translate-path mappings direction (cdr object))))
+   ;; Alist entry holding a sequence of paths
+   ((and (consp object)
+         (memq (car-safe object) monet--path-list-keys)
+         (sequencep (cdr object)))
+    (cons (car object)
+          (seq-into (seq-map (lambda (p)
+                               (if (stringp p)
+                                   (monet--translate-path mappings direction p)
+                                 p))
+                             (cdr object))
+                    (if (vectorp (cdr object)) 'vector 'list))))
+   ((consp object)
+    (cons (monet--translate-walk mappings direction (car object))
+          (monet--translate-walk mappings direction (cdr object))))
+   ((vectorp object)
+    (vconcat (seq-map (lambda (e) (monet--translate-walk mappings direction e))
+                      object)))
+   (t object)))
+
+(defun monet--translate-paths (session direction object)
+  "Translate path-bearing values in OBJECT for SESSION in DIRECTION.
+Returns OBJECT itself (no copy) when the session has no path mappings
+or is nil."
+  (let ((mappings (and session (monet--session-path-mappings session))))
+    (if (null mappings)
+        object
+      (monet--translate-walk mappings direction object))))
+
 ;;; Websockets Communication
 ;;;; Message sending functions
 (defun monet--send-response (ws id result)
-  "Send successful response with ID and RESULT to WS."
-  (let* ((data `((jsonrpc . "2.0")
+  "Send successful response with ID and RESULT to WS.
+Path-bearing values in RESULT are translated to guest paths when the
+session has path mappings."
+  (let* ((session (monet--find-session-by-client ws))
+         (data `((jsonrpc . "2.0")
                  (id . ,id)
-                 (result . ,result)))
+                 (result . ,(monet--translate-paths session 'to-guest result))))
          (response (json-encode data)))
     (websocket-send-text ws response)))
 
@@ -414,7 +508,8 @@ If PARAMS is not provided, uses an empty hash table."
       ;; Only send if session is initialized (unless it's the initialization-related notification)
       (when (or (and session (monet--session-initialized session))
                 (string-prefix-p "notifications/" method))
-        (let* ((params (or params (make-hash-table :test 'equal)))
+        (let* ((params (or (monet--translate-paths session 'to-guest params)
+                           (make-hash-table :test 'equal)))
                (data `((jsonrpc . "2.0")
                        (method . ,method)
                        (params . ,params)))
@@ -446,7 +541,10 @@ If PARAMS is not provided, uses an empty hash table."
                          (error "JSON parse error: %s" (error-message-string json-err)))))
              (id (alist-get 'id message))
              (method (alist-get 'method message))
-             (params (alist-get 'params message)))
+             ;; Inbound path-bearing fields become host paths up front, so
+             ;; every handler downstream works in host terms.
+             (params (monet--translate-paths session 'to-host
+                                             (alist-get 'params message))))
 
         (pcase method
           ;; Protocol initialization
@@ -490,6 +588,8 @@ If PARAMS is not provided, uses an empty hash table."
 
 Put client WS in SESSION structure, so we can use it to send messages to
 claude later."
+  (message "Monet session %s: client connected on port %d"
+           (monet--session-key session) (monet--session-port session))
   (setf (monet--session-client session) ws))
 
 (defun monet--on-close-server (session _ws)
@@ -498,6 +598,8 @@ claude later."
 Remove SESSION from `monet--sessions'."
   (let ((key (monet--session-key session))
         (port (monet--session-port session)))
+    (message "Monet session %s: client disconnected; removing session and lockfile (port %d)"
+             key port)
     ;; Remove lockfile
     (monet--remove-lockfile port)
     ;; Remove session
@@ -518,9 +620,14 @@ Remove SESSION from `monet--sessions'."
            action
            (error-message-string error)))
 
-(defun monet-start-server-in-directory (key directory)
+(defun monet-start-server-in-directory (key directory
+                                            &optional path-mappings)
   "Start websocker server for claude process with KEY running in DIRECTORY.
 
+PATH-MAPPINGS is an alist of (HOST-PREFIX . GUEST-PREFIX) when claude
+runs in a sandbox seeing DIRECTORY at a different path; protocol paths
+are translated at the session boundary and the lockfile also lists the
+guest view of DIRECTORY.
 Returns the session object."
   (let* ((dir (expand-file-name directory))
          (port (monet--find-free-port))
@@ -541,7 +648,8 @@ Returns the session object."
                    :deferred-responses (make-hash-table :test 'equal)
                    :originating-buffer (current-buffer)
                    :originating-tab current-tab-name
-                   :originating-frame (selected-frame))))
+                   :originating-frame (selected-frame)
+                   :path-mappings path-mappings)))
     (condition-case err
         (let ((server (websocket-server
                        port
@@ -558,8 +666,13 @@ Returns the session object."
           ;; Put server in the session
           (setf (monet--session-server session) server)
 
-          ;; Create lock file with auth token and session key
-          (monet--create-lockfile dir port (monet--session-auth-token session) key)
+          ;; Create lock file with auth token and session key.  When path
+          ;; mappings apply, also advertise the guest view of the folder so
+          ;; a sandboxed claude matches the lockfile against its cwd.
+          (monet--create-lockfile
+           dir port (monet--session-auth-token session) key
+           (let ((guest-dir (monet--translate-path path-mappings 'to-guest dir)))
+             (unless (equal guest-dir dir) (list guest-dir))))
 
           ;; Store session
           (puthash key session monet--sessions)
@@ -574,17 +687,22 @@ Returns the session object."
        (message "Failed to start MCP server: %s" (error-message-string err))
        nil))))
 
-(defun monet-start-server-function (key directory)
+(defun monet-start-server-function (key directory
+                                        &optional path-mappings)
   "Start a Monet server with KEY in DIRECTORY.
 
+PATH-MAPPINGS is an alist of (HOST-PREFIX . GUEST-PREFIX) when claude
+runs in a sandbox seeing DIRECTORY at a different path (see
+`monet-start-server-in-directory').
 Returns a plist (:env ENV-STRINGS :ports PORT-LIST) where ENV-STRINGS
 is the list of environment variable assignments needed by the Claude
 process and PORT-LIST lists the host ports it must be able to reach."
   (monet--start-hook-server)
-  (let* ((session (monet-start-server-in-directory key directory))
+  (let* ((session (monet-start-server-in-directory key directory
+                                                   path-mappings))
          (mcp-port (monet--session-port session))
          (hook-port monet--hook-port))
-    `(:env ("ENABLE_IDE_INTEGRATION=t"
+    `(:env ("ENABLE_IDE_INTEGRATION=true"
             ,(format "CLAUDE_CODE_SSE_PORT=%d" mcp-port)
             ,(format "MONET_HOOK_PORT=%d" hook-port))
       :ports (,mcp-port ,hook-port))))
@@ -2247,6 +2365,17 @@ No-op if HANDLER is already registered."
   (expand-file-name "monet-claude-hook.py"
                     (file-name-directory (locate-library "monet"))))
 
+(defun monet--claude-hooks-dir ()
+  "Return the directory hook scripts are installed into."
+  (expand-file-name "~/.claude/hooks/"))
+
+(defconst monet--claude-hook-command
+  "$HOME/.claude/hooks/monet-claude-hook.py"
+  "Hook command registered in settings.json.
+Deliberately $HOME-relative: hook commands run through /bin/sh, which
+expands $HOME — so the same settings.json works on the host and inside
+sandbox guests whose home differs (given ~/.claude is shared/mounted).")
+
 (defun monet--claude-settings-path ()
   "Return the path to ~/.claude/settings.json."
   (expand-file-name "~/.claude/settings.json"))
@@ -2279,45 +2408,57 @@ The inner hooks value may be a vector (after JSON round-trip) or a list;
          (first-hook (and hooks-val (elt hooks-val 0))))
     (and first-hook (cdr (assq 'command first-hook)))))
 
+(defun monet--hook-entry-monet-p (entry)
+  "Return non-nil when ENTRY's command is `monet--claude-hook-command'."
+  (equal (monet--hook-entry-command entry) monet--claude-hook-command))
+
+(defun monet--install-claude-hook-script ()
+  "Copy the hook script into `monet--claude-hooks-dir' and make it executable."
+  (let ((target (expand-file-name "monet-claude-hook.py"
+                                  (monet--claude-hooks-dir))))
+    (make-directory (monet--claude-hooks-dir) t)
+    (copy-file (monet--claude-hook-script-path) target t)
+    (set-file-modes target #o755)
+    target))
+
 (defun monet-install-claude-hooks ()
   "Install monet lifecycle hook entries in ~/.claude/settings.json.
-Adds Stop, SubagentStop, Notification, and UserPromptSubmit entries
-pointing to monet-claude-hook.py.  Idempotent: existing entries are
-not duplicated."
+Copies monet-claude-hook.py into ~/.claude/hooks/ and adds Stop,
+SubagentStop, Notification, and UserPromptSubmit entries running it via
+the $HOME-relative `monet--claude-hook-command'.  Idempotent."
   (interactive)
-  (let* ((script-path (monet--claude-hook-script-path))
-         (settings (or (monet--read-claude-settings) '()))
+  (monet--install-claude-hook-script)
+  (let* ((settings (or (monet--read-claude-settings) '()))
          (hooks-cell (assq 'hooks settings))
          (hooks (if hooks-cell (cdr hooks-cell) '()))
-         (new-entry (monet--hook-entry script-path))
+         (new-entry (monet--hook-entry monet--claude-hook-command))
          (event-names '(Stop SubagentStop Notification UserPromptSubmit)))
     (dolist (event event-names)
       (let* ((existing-cell (assq event hooks))
              (existing-list (if existing-cell
                                 (append (cdr existing-cell) nil)
                               nil))
-             (already-present
-              (cl-find script-path existing-list
-                       :test (lambda (path entry)
-                               (equal path (monet--hook-entry-command entry))))))
-        (unless already-present
-          (let ((updated-list (append existing-list (list new-entry))))
-            (if existing-cell
-                (setcdr existing-cell updated-list)
-              (push (cons event updated-list) hooks))))))
+             ;; Drop any existing monet entry, then append one fresh
+             ;; entry — idempotent by construction.
+             (updated-list (append (cl-remove-if #'monet--hook-entry-monet-p
+                                                 existing-list)
+                                   (list new-entry))))
+        (if existing-cell
+            (setcdr existing-cell updated-list)
+          (push (cons event updated-list) hooks))))
     (if hooks-cell
         (setcdr hooks-cell hooks)
       (push (cons 'hooks hooks) settings))
     (monet--write-claude-settings settings)
-    (message "Installed monet Claude hooks: %s" script-path)))
+    (message "Installed monet Claude hooks: %s" monet--claude-hook-command)))
 
 (defun monet-remove-claude-hooks ()
   "Remove monet's lifecycle hook entries from ~/.claude/settings.json.
 Removes Stop, SubagentStop, Notification, and UserPromptSubmit entries
-whose command matches monet-claude-hook.py.  Other hooks are preserved."
+whose command is `monet--claude-hook-command'.  Other hooks are
+preserved."
   (interactive)
-  (let* ((script-path (monet--claude-hook-script-path))
-         (settings (monet--read-claude-settings)))
+  (let ((settings (monet--read-claude-settings)))
     (if (null settings)
         (message "No ~/.claude/settings.json found; nothing to remove.")
       (let* ((hooks-cell (assq 'hooks settings))
@@ -2327,10 +2468,8 @@ whose command matches monet-claude-hook.py.  Other hooks are preserved."
           (let ((event-cell (assq event hooks)))
             (when event-cell
               (setcdr event-cell
-                      (cl-remove-if
-                       (lambda (entry)
-                         (equal script-path (monet--hook-entry-command entry)))
-                       (cdr event-cell))))))
+                      (cl-remove-if #'monet--hook-entry-monet-p
+                                    (cdr event-cell))))))
         (monet--write-claude-settings settings)
         (message "Removed monet Claude hooks.")))))
 
