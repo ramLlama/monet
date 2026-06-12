@@ -213,23 +213,23 @@ iff the tool's set is in this list.")
            (error "Error removing lockfile %s: %s" file (error-message-string err))))))))
 
 (defun monet--create-lockfile (folder port auth-token session-key
-                                      &optional extra-folders)
+                                      &optional extra-folders lockfile-pid)
   "Create the IDE lock file advertising the server on PORT.
 FOLDER is the workspace folder claude runs in; AUTH-TOKEN and
 SESSION-KEY identify the session.  EXTRA-FOLDERS are additional
 workspaceFolders entries appended after FOLDER — e.g. the guest-side
 path of a sandboxed worktree, so a Claude whose cwd is the guest path
-still matches this lockfile."
+still matches this lockfile.  LOCKFILE-PID overrides the advertised
+pid (default `emacs-pid'); Claude reaps lockfiles whose pid it cannot
+signal, so callers whose Claude runs in a separate pid namespace must
+pass a pid that is alive there (e.g. 1 inside a sandbox guest).  The
+default must stay a signalable host pid: on macOS, kill(1, 0) from
+userspace fails with EPERM, which Claude treats as a dead pid."
   (condition-case err
       (let* ((dir (monet--get-lockfile-dir))
              (file (expand-file-name (format "%d.lock" port) dir))
-             ;; pid 1 rather than (emacs-pid): Claude reaps lockfiles whose
-             ;; pid is dead, and the Emacs pid does not exist inside sandbox
-             ;; guests' pid namespaces (pid 1 exists everywhere).  Monet
-             ;; manages its own lockfile lifecycle, so Claude-side pid
-             ;; reaping is not load-bearing.
              (content (json-encode
-                       `((pid . 1)
+                       `((pid . ,(or lockfile-pid (emacs-pid)))
                          (workspaceFolders . ,(apply #'vector folder extra-folders))
                          (ideName . ,(format "Emacs (%s @ %d)" session-key port))
                          (transport . "ws")
@@ -621,13 +621,16 @@ Remove SESSION from `monet--sessions'."
            (error-message-string error)))
 
 (defun monet-start-server-in-directory (key directory
-                                            &optional path-mappings)
+                                            &optional path-mappings
+                                            lockfile-pid)
   "Start websocker server for claude process with KEY running in DIRECTORY.
 
 PATH-MAPPINGS is an alist of (HOST-PREFIX . GUEST-PREFIX) when claude
 runs in a sandbox seeing DIRECTORY at a different path; protocol paths
 are translated at the session boundary and the lockfile also lists the
-guest view of DIRECTORY.
+guest view of DIRECTORY.  LOCKFILE-PID is the pid advertised in the
+IDE lockfile when claude's pid namespace differs from Emacs's (see
+`monet--create-lockfile').
 Returns the session object."
   (let* ((dir (expand-file-name directory))
          (port (monet--find-free-port))
@@ -672,7 +675,8 @@ Returns the session object."
           (monet--create-lockfile
            dir port (monet--session-auth-token session) key
            (let ((guest-dir (monet--translate-path path-mappings 'to-guest dir)))
-             (unless (equal guest-dir dir) (list guest-dir))))
+             (unless (equal guest-dir dir) (list guest-dir)))
+           lockfile-pid)
 
           ;; Store session
           (puthash key session monet--sessions)
@@ -688,18 +692,22 @@ Returns the session object."
        nil))))
 
 (defun monet-start-server-function (key directory
-                                        &optional path-mappings)
+                                        &optional path-mappings
+                                        lockfile-pid)
   "Start a Monet server with KEY in DIRECTORY.
 
 PATH-MAPPINGS is an alist of (HOST-PREFIX . GUEST-PREFIX) when claude
 runs in a sandbox seeing DIRECTORY at a different path (see
-`monet-start-server-in-directory').
+`monet-start-server-in-directory').  LOCKFILE-PID is the pid
+advertised in the IDE lockfile when claude's pid namespace differs
+from Emacs's (see `monet--create-lockfile').
 Returns a plist (:env ENV-STRINGS :ports PORT-LIST) where ENV-STRINGS
 is the list of environment variable assignments needed by the Claude
 process and PORT-LIST lists the host ports it must be able to reach."
   (monet--start-hook-server)
   (let* ((session (monet-start-server-in-directory key directory
-                                                   path-mappings))
+                                                   path-mappings
+                                                   lockfile-pid))
          (mcp-port (monet--session-port session))
          (hook-port monet--hook-port))
     `(:env ("ENABLE_IDE_INTEGRATION=true"
