@@ -27,7 +27,7 @@ monet.el WebSocket Server (one per session, localhost:<random-port>)
    - Generate UUID auth token
    - Create `monet--session` struct
    - Start WebSocket server with `websocket-server`
-   - Write lockfile to `~/.claude/ide/<port>.lock` (`pid` is the literal `1`; `workspaceFolders` lists the host folder plus the guest path when path mappings apply)
+   - Write lockfile to `~/.claude/ide/<port>.lock` (`pid` is LOCKFILE-PID when given -- sandboxed callers pass 1 -- else `(emacs-pid)`; `workspaceFolders` lists the host folder plus the guest path when path mappings apply)
    - Register `post-command-hook` for selection tracking
 
 2. **Client connection** (`monet--on-open-server`):
