@@ -36,9 +36,15 @@ Claude Code
      → returns 200 OK (401 on bad token, 400 on unparseable body)
 ```
 
-The Python script requires both `MONET_HOOK_PORT` and `MONET_HOOK_TOKEN` to be set in
-its environment; it exits non-zero with a diagnostic on stderr if either is missing, if
-stdin is not valid JSON, or if the HTTP request fails / returns non-200.
+Hooks are installed globally, so every claude run invokes the script, including runs not
+started through monet.  Those have no `MONET_HOOK_PORT`, and the script exits 0 silently.
+Otherwise it exits non-zero with a diagnostic on stderr if stdin is not valid JSON or if
+the HTTP request fails / returns non-200.
+
+`monet-claude-hooks-installed-p` reports whether the installed script matches monet's own
+copy (an upgraded script reads as not installed until reinstalled) and `settings.json` has
+a monet entry for every event in `monet--claude-hook-events`.
+Integrations that depend on hook events (e.g. baton's status) use it to fail fast.
 
 ## HTTP Hook Server
 
