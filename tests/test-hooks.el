@@ -251,5 +251,85 @@ the monet repo is not, so the script must live under ~/.claude."
       (should (member "/usr/bin/other-hook.sh" commands))
       (should (member monet--claude-hook-command commands)))))
 
+;;; Installed check
+
+(ert-deftest monet-test-claude-hooks-installed-p-lifecycle ()
+  "Hooks read as installed only between install and remove."
+  (monet-test-with-settings-sandbox
+    (should-not (monet-claude-hooks-installed-p))
+    (monet-install-claude-hooks)
+    (should (monet-claude-hooks-installed-p))
+    (monet-remove-claude-hooks)
+    (should-not (monet-claude-hooks-installed-p))))
+
+(ert-deftest monet-test-claude-hooks-installed-p-requires-script ()
+  "Settings entries without the hook script on disk are not installed."
+  (monet-test-with-settings-sandbox
+    (monet-install-claude-hooks)
+    (delete-file (expand-file-name "monet-claude-hook.py"
+                                   (monet--claude-hooks-dir)))
+    (should-not (monet-claude-hooks-installed-p))))
+
+(ert-deftest monet-test-claude-hooks-installed-p-requires-every-event ()
+  "A settings file missing any monet hook event is not installed."
+  (monet-test-with-settings-sandbox
+    (monet-install-claude-hooks)
+    (let* ((settings (monet--read-claude-settings))
+           (hooks (cdr (assq 'hooks settings))))
+      (setcdr (assq 'hooks settings) (assq-delete-all 'Notification hooks))
+      (monet--write-claude-settings settings))
+    (should-not (monet-claude-hooks-installed-p))))
+
+;; An upgrade that changes the script must read as not installed, so
+;; integrations that fail fast on this check also prompt a reinstall.
+(ert-deftest monet-test-claude-hooks-installed-p-requires-current-script ()
+  "An installed hook script that differs from monet's copy is not installed."
+  (monet-test-with-settings-sandbox
+    (monet-install-claude-hooks)
+    (with-temp-file (expand-file-name "monet-claude-hook.py"
+                                      (monet--claude-hooks-dir))
+      (insert "#!/usr/bin/env python3\n# older monet\n"))
+    (should-not (monet-claude-hooks-installed-p))))
+
+;;; Hook script outside monet sessions
+
+(defconst monet-test--repo-hook-script
+  (expand-file-name "../monet-claude-hook.py"
+                    (file-name-directory (or load-file-name buffer-file-name)))
+  "This checkout's hook script.
+`monet--claude-hook-script-path' goes through `locate-library', which can
+resolve to an installed monet ahead of the checkout under test.")
+
+(ert-deftest monet-test-hook-script-silent-without-monet-env ()
+  "The hook script exits 0 with no output when MONET_HOOK_PORT is unset.
+Hooks are installed globally, so every claude run invokes the script,
+including ones not started through monet."
+  (skip-unless (executable-find "python3"))
+  (let ((process-environment
+         (cl-remove-if (lambda (e) (string-prefix-p "MONET_" e))
+                       process-environment))
+        (stdin (make-temp-file "monet-hook-stdin-" nil ".json"
+                               "{\"hook_event_name\": \"Stop\"}")))
+    (unwind-protect
+        (with-temp-buffer
+          (should (eq 0 (call-process "python3" stdin t nil
+                                      monet-test--repo-hook-script)))
+          (should (equal "" (buffer-string))))
+      (delete-file stdin))))
+
+(ert-deftest monet-test-hook-script-silent-without-monet-env-bad-stdin ()
+  "Without MONET_HOOK_PORT the script exits 0 silently even on unparseable stdin."
+  (skip-unless (executable-find "python3"))
+  (let ((process-environment
+         (cl-remove-if (lambda (e) (string-prefix-p "MONET_" e))
+                       process-environment))
+        (stdin (make-temp-file "monet-hook-stdin-" nil ".json" "not json")))
+    (unwind-protect
+        (with-temp-buffer
+          (should (eq 0 (call-process "python3" stdin t nil
+                                      monet-test--repo-hook-script)))
+          (should (equal "" (buffer-string))))
+      (delete-file stdin))))
+
 (provide 'test-hooks)
 ;;; tests/test-hooks.el ends here

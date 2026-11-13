@@ -9,16 +9,17 @@ import urllib.request
 
 MONET_CTX_ENVVAR_PREFIX = "MONET_CTX_"
 
+hook_port = os.environ.get("MONET_HOOK_PORT")
+
+# Hooks are installed globally, so claude sessions not started through
+# monet run this script too; they have no hook server to report to.
+if not hook_port:
+    sys.exit(0)
+
 try:
     payload = json.load(sys.stdin)
 except json.JSONDecodeError as e:
     print(f"monet-claude-hook: failed to parse stdin JSON: {e}", file=sys.stderr)
-    sys.exit(1)
-
-hook_port = os.environ.get("MONET_HOOK_PORT")
-
-if not hook_port:
-    print("monet-claude-hook: MONET_HOOK_PORT must be set", file=sys.stderr)
     sys.exit(1)
 
 ctx: dict[str, str] = {

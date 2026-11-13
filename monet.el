@@ -2368,21 +2368,32 @@ No-op if HANDLER is already registered."
   (setq monet--claude-hook-functions
         (delq handler monet--claude-hook-functions)))
 
+(defconst monet--claude-hook-script-name "monet-claude-hook.py"
+  "File name of monet's Claude hook script, in monet and once installed.")
+
 (defun monet--claude-hook-script-path ()
-  "Return the absolute path to monet-claude-hook.py."
-  (expand-file-name "monet-claude-hook.py"
+  "Return the absolute path to monet's own copy of the hook script."
+  (expand-file-name monet--claude-hook-script-name
                     (file-name-directory (locate-library "monet"))))
 
 (defun monet--claude-hooks-dir ()
   "Return the directory hook scripts are installed into."
   (expand-file-name "~/.claude/hooks/"))
 
+(defun monet--installed-claude-hook-script-path ()
+  "Return the path the hook script is installed to."
+  (expand-file-name monet--claude-hook-script-name (monet--claude-hooks-dir)))
+
 (defconst monet--claude-hook-command
-  "$HOME/.claude/hooks/monet-claude-hook.py"
+  (concat "$HOME/.claude/hooks/" monet--claude-hook-script-name)
   "Hook command registered in settings.json.
 Deliberately $HOME-relative: hook commands run through /bin/sh, which
 expands $HOME — so the same settings.json works on the host and inside
 sandbox guests whose home differs (given ~/.claude is shared/mounted).")
+
+(defconst monet--claude-hook-events
+  '(Stop SubagentStop Notification UserPromptSubmit)
+  "Claude Code hook events monet registers its hook command for.")
 
 (defun monet--claude-settings-path ()
   "Return the path to ~/.claude/settings.json."
@@ -2422,26 +2433,46 @@ The inner hooks value may be a vector (after JSON round-trip) or a list;
 
 (defun monet--install-claude-hook-script ()
   "Copy the hook script into `monet--claude-hooks-dir' and make it executable."
-  (let ((target (expand-file-name "monet-claude-hook.py"
-                                  (monet--claude-hooks-dir))))
+  (let ((target (monet--installed-claude-hook-script-path)))
     (make-directory (monet--claude-hooks-dir) t)
     (copy-file (monet--claude-hook-script-path) target t)
     (set-file-modes target #o755)
     target))
 
+(defun monet--file-contents (file)
+  "Return FILE's contents as a string."
+  (with-temp-buffer
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(defun monet-claude-hooks-installed-p ()
+  "Return non-nil when monet's current Claude hooks are fully installed.
+Requires the installed hook script to match monet's own copy (so an
+upgraded script reads as not installed until reinstalled) and a monet
+entry in ~/.claude/settings.json for every event in
+`monet--claude-hook-events'."
+  (let ((installed (monet--installed-claude-hook-script-path))
+        (hooks (cdr (assq 'hooks (monet--read-claude-settings)))))
+    (and (file-exists-p installed)
+         (equal (monet--file-contents installed)
+                (monet--file-contents (monet--claude-hook-script-path)))
+         (cl-every (lambda (event)
+                     (cl-some #'monet--hook-entry-monet-p
+                              (cdr (assq event hooks))))
+                   monet--claude-hook-events))))
+
 (defun monet-install-claude-hooks ()
   "Install monet lifecycle hook entries in ~/.claude/settings.json.
-Copies monet-claude-hook.py into ~/.claude/hooks/ and adds Stop,
-SubagentStop, Notification, and UserPromptSubmit entries running it via
-the $HOME-relative `monet--claude-hook-command'.  Idempotent."
+Copies the hook script into ~/.claude/hooks/ and adds an entry running it
+via the $HOME-relative `monet--claude-hook-command' for each event in
+`monet--claude-hook-events'.  Idempotent."
   (interactive)
   (monet--install-claude-hook-script)
   (let* ((settings (or (monet--read-claude-settings) '()))
          (hooks-cell (assq 'hooks settings))
          (hooks (if hooks-cell (cdr hooks-cell) '()))
-         (new-entry (monet--hook-entry monet--claude-hook-command))
-         (event-names '(Stop SubagentStop Notification UserPromptSubmit)))
-    (dolist (event event-names)
+         (new-entry (monet--hook-entry monet--claude-hook-command)))
+    (dolist (event monet--claude-hook-events)
       (let* ((existing-cell (assq event hooks))
              (existing-list (if existing-cell
                                 (append (cdr existing-cell) nil)
@@ -2462,17 +2493,15 @@ the $HOME-relative `monet--claude-hook-command'.  Idempotent."
 
 (defun monet-remove-claude-hooks ()
   "Remove monet's lifecycle hook entries from ~/.claude/settings.json.
-Removes Stop, SubagentStop, Notification, and UserPromptSubmit entries
-whose command is `monet--claude-hook-command'.  Other hooks are
-preserved."
+Removes entries whose command is `monet--claude-hook-command' from each
+event in `monet--claude-hook-events'.  Other hooks are preserved."
   (interactive)
   (let ((settings (monet--read-claude-settings)))
     (if (null settings)
         (message "No ~/.claude/settings.json found; nothing to remove.")
       (let* ((hooks-cell (assq 'hooks settings))
-             (hooks (and hooks-cell (cdr hooks-cell)))
-             (event-names '(Stop SubagentStop Notification UserPromptSubmit)))
-        (dolist (event event-names)
+             (hooks (and hooks-cell (cdr hooks-cell))))
+        (dolist (event monet--claude-hook-events)
           (let ((event-cell (assq event hooks)))
             (when event-cell
               (setcdr event-cell
